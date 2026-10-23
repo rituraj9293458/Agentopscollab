@@ -314,38 +314,7 @@ class RaceProofRunner:
         reproduced = bool(result["completed"] and result["reproduced_failure"])
         update: WorkflowState = {"investigation_attempts": attempts}
         if reproduced:
-            interpretation_state = dict(state)
-            interpretation_state["investigation_attempts"] = attempts
-            try:
-                conclusion = self.investigation_model.interpret(
-                    self._investigation_context(interpretation_state)
-                )
-            except Exception as exc:  # noqa: BLE001 - agent failure becomes terminal evidence
-                self._usage_event("observe")
-                update.update(self._model_failure(exc, "Investigation Agent observation failed"))
-                self._persist(state["run_id"], "observe", update)
-                return update
-            self._usage_event("observe")
-            if not conclusion.repair_ready:
-                if len(attempts) < self.settings.max_investigation_attempts:
-                    update.update(
-                        {
-                            "status": FinalStatus.SUSPECTED.value,
-                            "terminal_reason": "Investigation Agent requested additional evidence",
-                        }
-                    )
-                else:
-                    update.update(
-                        {
-                            "status": FinalStatus.UNRESOLVED.value,
-                            "terminal_reason": (
-                                "Confirmed invariant failure, but investigation evidence was "
-                                "insufficient for repair at the attempt cap"
-                            ),
-                        }
-                    )
-                self._persist(state["run_id"], "observe", update)
-                return update
+            decision = attempts[-1]["decision"]
             artifact = InvestigationArtifact(
                 target_id=self.target.config.id,
                 target_operation=self.target.config.operation.callable,
@@ -357,8 +326,11 @@ class RaceProofRunner:
                 ],
                 violated_invariant=result["invariant"],
                 final_database_state=result["invariant"]["evidence"],
-                hypothesized_root_cause=conclusion.root_cause,
-                execution_interpretation=conclusion.execution_interpretation,
+                hypothesized_root_cause=decision["reasoning_summary"],
+                execution_interpretation=(
+                    "PostgreSQL completed the selected schedule and the approved executable "
+                    "invariant reported a violation."
+                ),
                 evidence_references=[
                     f"schedule:{result['schedule_name']}",
                     f"invariant:{result['invariant']['name']}",
@@ -366,7 +338,7 @@ class RaceProofRunner:
                         f"source:{finding['file']}:{finding['line_start']}"
                         for finding in state.get("findings", [])
                     ],
-                    *conclusion.evidence_references,
+                    *[f"agent-evidence:{item}" for item in decision["supporting_evidence"]],
                 ],
             )
             engine = create_database_engine(self.database_url)

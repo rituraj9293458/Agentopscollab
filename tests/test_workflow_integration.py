@@ -9,7 +9,6 @@ from raceproof.config import Settings
 from raceproof.contracts import (
     FailureBundle,
     FinalStatus,
-    InvestigationConclusion,
     InvestigationContext,
     InvestigationDecision,
     PatchProposal,
@@ -34,7 +33,7 @@ class UnavailableAgent:
 
 
 class InvestigationTestDouble:
-    tool_names = frozenset({"read_approved_source", "select_controlled_experiment"})
+    tool_names = frozenset({"read_investigation_snapshot"})
 
     def __init__(self, choices: list[str] | None = None) -> None:
         self.choices = choices or ["stale_read_interleaving"]
@@ -57,19 +56,8 @@ class InvestigationTestDouble:
             supporting_evidence=[context.schema_ddl[:80], context.findings[0].explanation],
         )
 
-    def interpret(self, context: InvestigationContext) -> InvestigationConclusion:
-        latest = context.prior_attempts[-1]
-        assert latest.result is not None and latest.result.reproduced_failure
-        return InvestigationConclusion(
-            root_cause=latest.decision.reasoning_summary,
-            execution_interpretation="The actual PostgreSQL trace confirmed both conflicting commits.",
-            evidence_references=[f"schedule:{latest.result.schedule_name}"],
-            repair_ready=True,
-        )
-
-
 class GeneratedInventoryRepair:
-    tool_names = frozenset({"read_investigation_handoff", "read_editable_source"})
+    tool_names = frozenset({"read_repair_snapshot"})
 
     def __init__(self) -> None:
         self.bundles: list[FailureBundle] = []
@@ -123,7 +111,7 @@ class GeneratedInventoryRepair:
 
 
 class RejectingRepair:
-    tool_names = frozenset({"read_investigation_handoff"})
+    tool_names = frozenset({"read_repair_snapshot"})
 
     def __init__(self) -> None:
         self.calls = 0

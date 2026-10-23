@@ -61,7 +61,7 @@ load -> inspect -> Investigation Agent -> execute experiment -> observe
                          bounded attempts
 ```
 
-The agents use distinct LangChain prompts, structured outputs, and tools. Investigation tools are read-only plus controlled experiment selection. Repair tools expose the confirmed handoff, editable source, schema, patch policy, and prior verification feedback. LangGraph owns both bounded loops and passes a compact typed artifact between them instead of an open-ended conversation.
+The agents use distinct LangChain prompts, structured outputs, and tools. Each agent gets one role-specific snapshot tool containing only its approved bounded context. This avoids a separate provider request for every source, schema, schedule, and feedback read. LangGraph validates the selected experiment, owns both bounded loops, and passes a compact typed artifact between them instead of an open-ended conversation.
 
 Each repair attempt starts from the unchanged target repository. A diff can touch only declared editable paths. It is checked with `git apply --check`, parsed, compiled, and executed in a disposable copy. If the original checkpoint no longer exists, the exact schedule is marked invalid or timed out and the verifier tries only a developer-declared adapted schedule. A missing checkpoint never becomes a pass.
 
@@ -135,15 +135,21 @@ raceproof run --config examples/inventory_app/raceproof.json
 
 The default Investigation Agent uses `gemini-3.5-flash-lite`. The Repair Agent uses `gemini-3.1-flash-lite`. Optional fallback uses `gemini-3.8-flash` and is disabled by default. Set `RACEPROOF_ENABLE_MODEL_FALLBACK=true` only after validating it. Fallback occurs only for unavailable-model or structured-output failures. It does not bypass authentication, quota, rate, or local budget failures.
 
-Local budgets default to 12 total provider requests, 5 Investigation Agent requests, 7 Repair Agent requests, and 60,000 provider-reported tokens. Request limits are enforced before a provider call. Token limits are enforced from provider metadata and stop the next call after an overrun. If metadata is missing, the report marks token totals as lower bounds. Dollar estimates are omitted unless a verified pricing table is explicitly configured.
+Local budgets default to 12 total provider requests, 5 Investigation Agent requests, 7 Repair Agent requests, and 60,000 provider-reported tokens. A normal successful path uses one snapshot tool round trip per agent and does not make a second Investigation Agent call after PostgreSQL has already established the result. Provider retries default to one. Request limits are enforced before a provider call. Token limits are enforced from provider metadata and stop the next call after an overrun. If metadata is missing, the report marks token totals as lower bounds. Dollar estimates are omitted unless a verified pricing table is explicitly configured.
 
 ## API and dashboard
 
 ```powershell
-uvicorn raceproof.api:app --reload
+.\scripts\start_backend.ps1
 npm --prefix frontend install
 npm --prefix frontend run dev
 ```
+
+The backend launcher restricts reload monitoring to `src/raceproof`. Do not run unrestricted
+`uvicorn raceproof.api:app --reload` from the repository root. Repair and verification create
+Python files under `artifacts/`; an unrestricted watcher would restart the API during the run and
+discard its in-memory run registry. For a backend with reload disabled, use
+`.\scripts\start_backend.ps1 -NoReload`.
 
 The dashboard fetches generic target metadata and sends only a selected `target_id` when starting a run.
 
@@ -184,7 +190,7 @@ Runs write to the engine artifact root:
 - The live `validate-models` command is opt-in, consumes provider quota, and was not run unless a real key was configured.
 - Verification covers configured finite schedules and outcomes, not all possible interleavings.
 - Candidate code runs in a child process and disposable workspace, but not an OS sandbox. Use a restricted container or VM for untrusted generated code.
-- The API run store and LangGraph checkpointer are in memory. JSONL and reports are durable, but active runs are not restartable.
+- The API run store and LangGraph checkpointer are in memory, so an active run is not restartable. Completed reports are durable and the API reloads them by run ID after a backend restart.
 - Patch filtering is defense in depth and cannot prove arbitrary generated code is benign.
 - Performance results are local observations, not production capacity claims.
 

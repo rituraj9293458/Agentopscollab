@@ -53,10 +53,8 @@ def test_agents_have_distinct_prompts_structures_and_tool_permissions() -> None:
     repair = GeminiRepairAgent("gemini-3.8-flash")
     assert investigator.system_prompt != repair.system_prompt
     assert investigator.tool_names != repair.tool_names
-    assert "select_controlled_experiment" in investigator.tool_names
-    assert "read_investigation_handoff" in repair.tool_names
-    assert "read_investigation_handoff" not in investigator.tool_names
-    assert "select_controlled_experiment" not in repair.tool_names
+    assert investigator.tool_names == {"read_investigation_snapshot"}
+    assert repair.tool_names == {"read_repair_snapshot"}
     assert "patch" not in " ".join(investigator.tool_names)
     assert InvestigationDecision.model_fields["experiment_name"]
 
@@ -86,10 +84,15 @@ def test_investigation_agent_tools_are_bound_to_approved_target_evidence() -> No
     agent = GeminiInvestigationAgent("gemini-3.8-flash")
     tools = {item.name: item for item in agent._tools(context)}
     assert set(tools) == set(agent.tool_names)
+    snapshot = tools["read_investigation_snapshot"].invoke({})
     approved = target.config.operation.source_files[0]
-    assert "purchase_inventory" in tools["read_approved_source"].invoke({"path": approved})
-    assert tools["read_approved_source"].invoke({"path": "../secret"}).startswith("DENIED")
-    selected = tools["select_controlled_experiment"].invoke(
-        {"name": target.config.reproduction_schedule.name}
+    assert "purchase_inventory" in snapshot["source_files"][approved]
+    assert set(snapshot["source_files"]) == set(target.config.operation.source_files)
+    assert snapshot["available_experiments"][0]["name"] == (
+        target.config.reproduction_schedule.name
     )
-    assert selected["approved"] is True
+    repeated = tools["read_investigation_snapshot"].invoke({})
+    assert repeated == {
+        "already_read": True,
+        "instruction": "Use the snapshot already returned.",
+    }

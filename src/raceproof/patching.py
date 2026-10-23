@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import difflib
+import os
 import re
 import shutil
 import subprocess
@@ -10,6 +11,8 @@ from pathlib import Path
 from raceproof.contracts import PatchValidation
 
 DIFF_PATH = re.compile(r"^(?:\+\+\+|---)\s+(?:a/|b/)?([^\t\r\n]+)", re.MULTILINE)
+OLD_DIFF_PATH = re.compile(r"^---\s+(?:a/)?([^\t\r\n]+)", re.MULTILINE)
+NEW_DIFF_PATH = re.compile(r"^\+\+\+\s+(?:b/)?([^\t\r\n]+)", re.MULTILINE)
 FORBIDDEN_ADDITIONS = (
     "raceproof.checkpoint",
     "RACEPROOF_SCHEDULE",
@@ -20,6 +23,22 @@ FORBIDDEN_ADDITIONS = (
     "httpx.",
     "socket.",
 )
+
+
+def normalize_unified_diff(diff: str) -> str:
+    """Add an unambiguous Git header to a single-file standard unified diff."""
+    normalized = diff.strip() + "\n"
+    if normalized.startswith("diff --git "):
+        return normalized
+    old_paths = OLD_DIFF_PATH.findall(normalized)
+    new_paths = NEW_DIFF_PATH.findall(normalized)
+    if len(old_paths) != 1 or len(new_paths) != 1:
+        return normalized
+    old_path = Path(old_paths[0]).as_posix()
+    new_path = Path(new_paths[0]).as_posix()
+    if old_path == "/dev/null" or new_path == "/dev/null" or old_path != new_path:
+        return normalized
+    return f"diff --git a/{old_path} b/{new_path}\n{normalized}"
 
 
 class WorkspaceManager:
@@ -60,6 +79,7 @@ class PatchGuard:
         self.max_changed_lines = max_changed_lines
 
     def validate(self, diff: str) -> PatchValidation:
+        diff = normalize_unified_diff(diff)
         errors: list[str] = []
         paths = sorted(
             {Path(match).as_posix() for match in DIFF_PATH.findall(diff) if match != "/dev/null"}
@@ -95,9 +115,17 @@ class PatchGuard:
         return PatchValidation(accepted=not errors, errors=errors, changed_paths=paths)
 
     def apply(self, candidate: Path, diff: str) -> PatchValidation:
+        diff = normalize_unified_diff(diff)
         validation = self.validate(diff)
         if not validation.accepted:
             return validation
+        git_env = dict(os.environ)
+        git_env["GIT_CEILING_DIRECTORIES"] = str(candidate.resolve().parent)
+        before = {
+            path: (candidate / path).read_bytes()
+            for path in validation.changed_paths
+            if (candidate / path).is_file()
+        }
         check = subprocess.run(
             ["git", "apply", "--check", "--ignore-space-change", "-"],
             input=diff,
@@ -107,6 +135,7 @@ class PatchGuard:
             timeout=15,
             shell=False,
             check=False,
+            env=git_env,
         )
         if check.returncode != 0:
             validation.accepted = False
@@ -121,10 +150,49 @@ class PatchGuard:
             timeout=15,
             shell=False,
             check=False,
+            env=git_env,
         )
+        if applied.returncode != 0 and not applied.stderr.strip():
+            recheck = subprocess.run(
+                ["git", "apply", "--check", "--ignore-space-change", "-"],
+                input=diff,
+                text=True,
+                capture_output=True,
+                cwd=candidate,
+                timeout=15,
+                shell=False,
+                check=False,
+                env=git_env,
+            )
+            if recheck.returncode == 0:
+                applied = subprocess.run(
+                    ["git", "apply", "--ignore-space-change", "-"],
+                    input=diff,
+                    text=True,
+                    capture_output=True,
+                    cwd=candidate,
+                    timeout=15,
+                    shell=False,
+                    check=False,
+                    env=git_env,
+                )
         if applied.returncode != 0:
             validation.accepted = False
-            validation.errors.append(f"git apply failed: {applied.stderr.strip()}")
+            detail = applied.stderr.strip() or applied.stdout.strip() or "no diagnostic output"
+            validation.errors.append(
+                f"git apply failed with exit code {applied.returncode}: {detail}"
+            )
+            return validation
+        unchanged = [
+            path
+            for path, content in before.items()
+            if (candidate / path).is_file() and (candidate / path).read_bytes() == content
+        ]
+        if unchanged:
+            validation.accepted = False
+            validation.errors.append(
+                "git apply reported success but did not change: " + ", ".join(unchanged)
+            )
             return validation
         for path in validation.changed_paths:
             if path.endswith(".py"):

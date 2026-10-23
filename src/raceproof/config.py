@@ -24,7 +24,7 @@ class Settings(BaseSettings):
     fallback_model: str = "gemini-3.8-flash"
     enable_model_fallback: bool = False
     model_name: str | None = None
-    model_max_retries: int = Field(default=2, ge=0, le=5)
+    model_max_retries: int = Field(default=1, ge=0, le=5)
     max_model_requests: int = Field(default=12, ge=1, le=100)
     max_investigation_requests: int = Field(default=5, ge=1, le=50)
     max_repair_requests: int = Field(default=7, ge=1, le=50)

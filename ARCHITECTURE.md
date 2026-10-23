@@ -79,7 +79,7 @@ If a candidate removes or relocates a checkpoint, the original schedule becomes 
 
 ## Investigation Agent
 
-The Investigation Agent is a LangChain tool-calling agent with its own system prompt and `InvestigationDecision` structured output. Its tools can read approved source, inspect schema DDL, list transaction boundaries, list synchronization checkpoints, list approved experiments, and select one controlled experiment. It cannot read arbitrary files, generate a patch, or claim execution results.
+The Investigation Agent is a LangChain tool-calling agent with its own system prompt and `InvestigationDecision` structured output. Its single snapshot tool returns approved source, schema DDL, transaction boundaries, synchronization checkpoints, approved experiments, and prior bounded evidence together. This keeps the same read boundary while avoiding a provider round trip per evidence category. It cannot read arbitrary files, generate a patch, or claim execution results. LangGraph validates the selected experiment name before execution.
 
 LangGraph executes the selected schedule outside the agent. If the invariant does not fail, the exact `ScheduleResult` is appended to the next `InvestigationContext`. The agent can revise its hypothesis until `max_investigation_attempts` is reached. Failure to confirm ends as `UNCONFIRMED`.
 
@@ -105,7 +105,7 @@ The Repair Agent is a second LangChain tool-calling agent with a different syste
 - editable and protected paths;
 - prior failed patch and verification attempts.
 
-Its tools read the handoff, editable source, schema, patch policy, and verification feedback. They do not expose arbitrary files or pass authority. `PatchProposal` contains diagnosis, strategy, assumptions, complete unified diff, expected SQL shape, optional schedule hint, residual risks, and `cannot_repair`.
+Its single snapshot tool reads the handoff, editable source, schema, patch policy, and bounded verification feedback together. It does not expose arbitrary files or pass authority. `PatchProposal` contains diagnosis, strategy, assumptions, complete unified diff, expected SQL shape, optional schedule hint, residual risks, and `cannot_repair`.
 
 ## Patch containment and isolation
 

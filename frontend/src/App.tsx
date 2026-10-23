@@ -19,7 +19,7 @@ function Metric({ label, value, accent = false }: { label: string; value: string
 }
 
 function App() {
-  const [runId, setRunId] = useState<string | null>(null)
+  const [runId, setRunId] = useState<string | null>(() => localStorage.getItem('raceproof.runId'))
   const [events, setEvents] = useState<RunEvent[]>([])
   const [report, setReport] = useState<RunReport | null>(null)
   const [status, setStatus] = useState('READY')
@@ -28,6 +28,15 @@ function App() {
   const [targets, setTargets] = useState<Target[]>([])
   const [targetId, setTargetId] = useState('')
   const [modelStatus, setModelStatus] = useState<ModelStatus | null>(null)
+
+  function resetInterruptedRun(message: string) {
+    localStorage.removeItem('raceproof.runId')
+    setRunId(null)
+    setEvents([])
+    setReport(null)
+    setStatus('READY')
+    setError(message)
+  }
 
   useEffect(() => {
     fetch(`${API}/api/health`).then(r => r.json()).then(data => setHealth(data.postgresql)).catch(() => setHealth(false))
@@ -44,24 +53,65 @@ function App() {
       body: JSON.stringify({ target_id: targetId }),
     })
     if (!response.ok) throw new Error(await response.text())
-    const data = await response.json(); setRunId(data.run_id)
+    const data = await response.json()
+    localStorage.setItem('raceproof.runId', data.run_id)
+    setRunId(data.run_id)
   }
 
   useEffect(() => {
     if (!runId) return
     const source = new EventSource(`${API}/api/runs/${runId}/events`)
     source.onmessage = event => {
-      const item = JSON.parse(event.data) as RunEvent
-      setEvents(previous => previous.some(existing => existing.sequence === item.sequence) ? previous : [...previous, item])
-      if (item.kind === 'stage') setStatus(item.stage.toUpperCase())
+      try {
+        const item = JSON.parse(event.data) as RunEvent
+        if (item && typeof item === 'object') {
+          setEvents(previous => previous.some(existing => existing.sequence === item.sequence) ? previous : [...previous, item])
+          if (item.kind === 'stage' && item.stage) setStatus(item.stage.toUpperCase())
+        }
+      } catch (err) {
+        console.error('Failed to parse SSE event:', err)
+      }
     }
     source.addEventListener('done', async () => {
       source.close()
-      const response = await fetch(`${API}/api/runs/${runId}`)
-      const data = await response.json()
-      setStatus(data.status); setReport(data.report); setError(data.error)
+      try {
+        const response = await fetch(`${API}/api/runs/${runId}`)
+        if (response.status === 404) {
+          resetInterruptedRun(
+            'The backend restarted and discarded this in-memory run. Start a new investigation.',
+          )
+          return
+        }
+        if (response.ok) {
+          const data = await response.json()
+          setStatus(data.status ?? 'COMPLETED')
+          setReport(data.report ?? null)
+          setError(data.error ?? null)
+        }
+      } catch (err) {
+        console.error('Failed to fetch completed run report:', err)
+      }
     })
-    source.onerror = () => { source.close(); setError('Event stream disconnected.') }
+    source.onerror = async () => {
+      source.close()
+      try {
+        const response = await fetch(`${API}/api/runs/${runId}`)
+        if (response.status === 404) {
+          resetInterruptedRun(
+            'The backend restarted and discarded this in-memory run. Start a new investigation.',
+          )
+          return
+        }
+      } catch {
+        // The API may be temporarily unavailable while its process restarts.
+      }
+      setStatus('READY')
+      localStorage.removeItem('raceproof.runId')
+      setRunId(null)
+      setEvents([])
+      setReport(null)
+      setError('Event stream disconnected. Start a new investigation.')
+    }
     return () => source.close()
   }, [runId])
 
@@ -122,7 +172,7 @@ function App() {
             <div className={`actor actor-${actor.toLowerCase()}`}>{actor}</div>
             <div className="lane-track">
               {transactions.filter(event => event.actor === actor).map(event => <div className={`tx-event ${event.kind}`} key={event.sequence}>
-                <span>{event.action.replaceAll('_', ' ')}</span><small>#{event.sequence}</small>
+                <span>{(event.action ?? '').replaceAll('_', ' ')}</span><small>#{event.sequence}</small>
               </div>)}
               {!transactions.some(event => event.actor === actor) && <div className="lane-empty">Waiting for transaction events</div>}
             </div>
@@ -133,21 +183,21 @@ function App() {
 
       <article className="panel invariant-panel">
         <div className="panel-head"><div><span className="kicker">DETERMINISTIC ORACLE</span><h2>Business invariant</h2></div><ShieldCheck size={20}/></div>
-        <code>{invariant?.assertion ?? target?.invariant.description ?? 'Waiting for the approved target invariant'}</code>
+        <code>{invariant?.assertion ?? target?.invariant?.description ?? 'Waiting for the approved target invariant'}</code>
         <div className={`verdict ${invariant ? (invariant.passed ? 'pass' : 'fail') : ''}`}>
           {invariant ? (invariant.passed ? <Check/> : <X/>) : <CircleDot/>}
           <div><span>INVARIANT</span><strong>{invariant ? (invariant.passed ? 'PASSED' : 'FAILED') : 'PENDING'}</strong></div>
         </div>
-        <div className="invariant-stats">{evidence.map(([label, value], index) => <Metric key={label} label={label.replaceAll('_', ' ')} value={String(value)} accent={index === 1}/>)}</div>
+        <div className="invariant-stats">{evidence.map(([label, value], index) => <Metric key={label} label={(label ?? '').replaceAll('_', ' ')} value={String(value ?? '')} accent={index === 1}/>)}</div>
       </article>
 
       <article className="panel activity-panel">
         <div className="panel-head"><div><span className="kicker">LLM AGENT 1</span><h2>Investigation Agent</h2></div><TerminalSquare size={20}/></div>
         <div className="activity-list">
           {investigationEvents.slice(-6).map(event => <div className="activity-row" key={event.sequence}>
-            <span className={`activity-icon ${event.kind}`}><ChevronRight size={13}/></span><div><strong>{event.action.replaceAll('_', ' ')}</strong><small>{String(event.detail.reasoning_summary ?? event.detail.root_cause ?? event.detail.schedule ?? new Date(event.timestamp).toLocaleTimeString())}</small></div>
+            <span className={`activity-icon ${event.kind}`}><ChevronRight size={13}/></span><div><strong>{(event.action ?? '').replaceAll('_', ' ')}</strong><small>{String(event.detail?.reasoning_summary ?? event.detail?.root_cause ?? event.detail?.schedule ?? (event.timestamp ? new Date(event.timestamp).toLocaleTimeString() : ''))}</small></div>
           </div>)}
-          {investigation && <div className="agent-summary"><strong>{investigation.decision.concurrency_pattern}</strong><p>{investigation.decision.reasoning_summary}</p><small>Experiment: {investigation.decision.experiment_name} · confidence {Math.round(investigation.decision.confidence * 100)}%</small></div>}
+          {investigation?.decision && <div className="agent-summary"><strong>{investigation.decision.concurrency_pattern ?? 'Concurrency Pattern'}</strong><p>{investigation.decision.reasoning_summary ?? ''}</p><small>Experiment: {investigation.decision.experiment_name ?? 'experiment'} · confidence {Math.round((investigation.decision.confidence ?? 0) * 100)}%</small></div>}
           {!investigationEvents.length && !investigation && <div className="empty-state"><Activity size={24}/><p>Waiting for a structured LLM hypothesis.</p></div>}
         </div>
       </article>
@@ -156,13 +206,13 @@ function App() {
         <div className="panel-head"><div><span className="kicker">LOCAL COST CONTROL</span><h2>Model usage</h2></div><Gauge size={20}/></div>
         <div className="invariant-stats">
           <Metric label="Requests" value={usage?.total_requests ?? 0} accent/>
-          <Metric label="Reported tokens" value={usage ? `${usage.total_tokens}${usage.unknown_token_responses ? '+' : ''}` : '0'}/>
-          <Metric label="Requests left" value={usage?.remaining_request_budget ?? modelStatus?.budgets.max_model_requests ?? '-'}/>
+          <Metric label="Reported tokens" value={usage ? `${usage.total_tokens ?? 0}${usage.unknown_token_responses ? '+' : ''}` : '0'}/>
+          <Metric label="Requests left" value={usage?.remaining_request_budget ?? modelStatus?.budgets?.max_model_requests ?? '-'}/>
         </div>
         <div className="agent-summary">
-          <strong>Investigation: {report?.investigation_model ?? modelStatus?.investigation_model ?? 'loading'}</strong>
-          <p>Repair: {report?.repair_model ?? modelStatus?.repair_model ?? 'loading'}</p>
-          <small>Investigation requests {usage?.requests_by_agent.investigation ?? 0} · Repair requests {usage?.requests_by_agent.repair ?? 0} · Fallback {usage?.fallback_invocations ?? 0}</small>
+          <strong>Investigation: {report?.investigation_model || modelStatus?.investigation_model || 'loading'}</strong>
+          <p>Repair: {report?.repair_model || modelStatus?.repair_model || 'loading'}</p>
+          <small>Investigation requests {usage?.requests_by_agent?.investigation ?? 0} · Repair requests {usage?.requests_by_agent?.repair ?? 0} · Fallback {usage?.fallback_invocations ?? 0}</small>
         </div>
         <div className="schedule-caption"><AlertTriangle size={15}/><span>{usage?.unknown_token_responses ? 'Some provider token metadata is unavailable. Token totals are lower bounds.' : usage?.approximate_cost_usd != null ? `Verified configured estimate: $${usage.approximate_cost_usd.toFixed(6)}${usage.cost_is_partial ? ' partial' : ''}` : 'Dollar estimates stay hidden until verified pricing is configured.'}</span></div>
       </article>
@@ -171,9 +221,9 @@ function App() {
         <div className="panel-head"><div><span className="kicker">LLM AGENT 2</span><h2>Repair Agent</h2></div><Code2 size={20}/></div>
         <div className="activity-list">
           {repairEvents.slice(-6).map(event => <div className="activity-row" key={event.sequence}>
-            <span className={`activity-icon ${event.kind}`}><ChevronRight size={13}/></span><div><strong>{event.action.replaceAll('_', ' ')}</strong><small>{String(event.detail.strategy ?? (event.detail.passed === true ? 'verification passed' : event.detail.passed === false ? 'verification failed' : new Date(event.timestamp).toLocaleTimeString()))}</small></div>
+            <span className={`activity-icon ${event.kind}`}><ChevronRight size={13}/></span><div><strong>{(event.action ?? '').replaceAll('_', ' ')}</strong><small>{String(event.detail?.strategy ?? (event.detail?.passed === true ? 'verification passed' : event.detail?.passed === false ? 'verification failed' : (event.timestamp ? new Date(event.timestamp).toLocaleTimeString() : '')))}</small></div>
           </div>)}
-          {repairAttempt?.proposal && <div className="agent-summary"><strong>{repairAttempt.proposal.strategy}</strong><p>{repairAttempt.proposal.diagnosis}</p><small>{repairAttempt.failure_reason ?? 'Candidate awaiting deterministic gates'}</small></div>}
+          {repairAttempt?.proposal && <div className="agent-summary"><strong>{repairAttempt.proposal.strategy ?? 'Repair Proposal'}</strong><p>{repairAttempt.proposal.diagnosis ?? ''}</p><small>{repairAttempt.failure_reason ?? 'Candidate awaiting deterministic gates'}</small></div>}
           {!repairEvents.length && !repairAttempt && <div className="empty-state"><Code2 size={24}/><p>Repair starts only after a confirmed invariant violation.</p></div>}
         </div>
       </article>
@@ -185,7 +235,7 @@ function App() {
           <ArrowRight size={20}/>
           <div className={`compare-card after ${verification?.passed ? 'verified' : ''}`}><span>AFTER</span><strong>{verification?.passed ? 'All declared gates passed' : 'Not verified'}</strong><small>{verification ? `${verification.replay_mode} replay` : 'Candidate required'}</small></div>
         </div>
-        {verification && <div className="gate-grid">{Object.entries(verification.gates).map(([name, passed]) => <div key={name} className={passed ? 'gate pass' : 'gate fail'}>{passed ? <Check size={13}/> : <X size={13}/>}<span>{name.replaceAll('_', ' ')}</span></div>)}</div>}
+        {verification?.gates && <div className="gate-grid">{Object.entries(verification.gates).map(([name, passed]) => <div key={name} className={passed ? 'gate pass' : 'gate fail'}>{passed ? <Check size={13}/> : <X size={13}/>}<span>{(name ?? '').replaceAll('_', ' ')}</span></div>)}</div>}
       </article>
     </section>
 
@@ -193,6 +243,7 @@ function App() {
       <div className="panel-head"><div><span className="kicker">REVIEWABLE ARTIFACT</span><h2>Candidate patch</h2></div><Code2 size={20}/></div>
       <pre>{report?.final_diff ?? 'No verified candidate diff. Live repair requires a configured model API key; failed or unverified patches are never promoted.'}</pre>
     </section>
+
 
     <footer><span>RaceProof experimental prototype</span><span>Finite tests establish observed evidence, not formal race freedom.</span>{runId && <span>RUN {runId}</span>}</footer>
   </main>

@@ -6,7 +6,7 @@ from pathlib import Path
 from raceproof.config import get_settings
 from raceproof.database import create_database_engine
 from raceproof.events import EventRecorder
-from raceproof.model import LangChainRepairModel
+from raceproof.model import GeminiRepairModel
 from raceproof.sample.inventory import purchase_inventory
 from raceproof.scheduler import ControlledScheduler
 from raceproof.workflow import RaceProofRunner
@@ -31,7 +31,7 @@ def main() -> int:
         print(result.model_dump_json(indent=2))
         return 0 if result.invariant and not result.invariant.passed else 2
     root = Path.cwd()
-    model = LangChainRepairModel(settings.model_provider, settings.model_name)
+    model = GeminiRepairModel(settings.model_name)
     report = RaceProofRunner(root, settings, model).run()
     print(report.model_dump_json(indent=2))
     return (

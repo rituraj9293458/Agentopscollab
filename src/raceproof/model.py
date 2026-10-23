@@ -13,39 +13,38 @@ class RepairModel(Protocol):
     def propose(self, bundle: FailureBundle) -> PatchProposal: ...
 
 
-class LangChainRepairModel:
-    """Configurable live model integration. It never substitutes a canned repair."""
+class GeminiRepairModel:
+    """Gemini repair integration. It never substitutes a canned repair."""
 
-    def __init__(self, provider: str, model_name: str) -> None:
-        self.provider = provider.lower()
+    def __init__(self, model_name: str) -> None:
         self.model_name = model_name
 
     def available(self) -> tuple[bool, str]:
-        key_names = {
-            "openai": "OPENAI_API_KEY",
-            "anthropic": "ANTHROPIC_API_KEY",
-        }
-        key_name = key_names.get(self.provider)
-        if key_name is None:
-            return False, f"unsupported model provider: {self.provider}"
-        if not os.environ.get(key_name):
-            return False, f"{key_name} is not configured; live autonomous repair is unavailable"
+        if not (os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")):
+            return (
+                False,
+                (
+                    "GEMINI_API_KEY or GOOGLE_API_KEY is not configured; "
+                    "live autonomous repair is unavailable"
+                ),
+            )
         try:
-            if self.provider == "openai":
-                import langchain_openai  # noqa: F401
-            elif self.provider == "anthropic":
-                import langchain_anthropic  # noqa: F401
+            import langchain_google_genai  # noqa: F401
         except ImportError:
-            return False, f"LangChain integration package for {self.provider} is not installed"
-        return True, "live model configured"
+            return False, "langchain-google-genai is not installed"
+        return True, f"Gemini model {self.model_name} configured"
 
     def propose(self, bundle: FailureBundle) -> PatchProposal:
         available, reason = self.available()
         if not available:
             raise RuntimeError(reason)
-        from langchain.chat_models import init_chat_model
+        from langchain_google_genai import ChatGoogleGenerativeAI
 
-        model = init_chat_model(self.model_name, model_provider=self.provider, temperature=0)
+        model = ChatGoogleGenerativeAI(
+            model=self.model_name,
+            temperature=0,
+            max_retries=2,
+        )
         structured = model.with_structured_output(PatchProposal)
         prompt = (
             "You are RaceProof's bounded concurrency repair agent. Diagnose the reproduced "

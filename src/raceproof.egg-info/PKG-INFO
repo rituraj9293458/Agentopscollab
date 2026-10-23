@@ -12,10 +12,8 @@ Requires-Dist: sqlalchemy<2.1,>=2.0.36
 Requires-Dist: psycopg[binary]<4,>=3.2
 Requires-Dist: langchain<2,>=1.0
 Requires-Dist: langgraph<2,>=1.0
-Provides-Extra: openai
-Requires-Dist: langchain-openai<2,>=1.0; extra == "openai"
-Provides-Extra: anthropic
-Requires-Dist: langchain-anthropic<2,>=1.0; extra == "anthropic"
+Provides-Extra: gemini
+Requires-Dist: langchain-google-genai<5,>=4.4; extra == "gemini"
 Provides-Extra: dev
 Requires-Dist: pytest<10,>=8.3; extra == "dev"
 Requires-Dist: pytest-cov<8,>=6; extra == "dev"

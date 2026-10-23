@@ -45,7 +45,7 @@ The LLM cannot change this code because scheduler, invariant, tests, and fixture
 
 ### Repair model
 
-`LangChainRepairModel` initializes the configured provider only when the matching API key and provider package exist. `PatchProposal` is a Pydantic schema containing diagnosis, strategy, assumptions, a complete unified diff, expected SQL shape, anchor hint, residual risks, and `cannot_repair`.
+`GeminiRepairModel` initializes `ChatGoogleGenerativeAI` only when `GEMINI_API_KEY` or `GOOGLE_API_KEY` and the integration package exist. `PatchProposal` is a Pydantic schema containing diagnosis, strategy, assumptions, a complete unified diff, expected SQL shape, anchor hint, residual risks, and `cannot_repair`.
 
 The model receives exact source, models, schema description, actor trace, final rows, invariant result, allowed outcomes, editable paths, and prior failed attempts. Secrets and environment contents are not included.
 
@@ -119,4 +119,6 @@ The FastAPI run store is not designed for multiple server workers. A production 
 - [LangGraph overview](https://docs.langchain.com/oss/python/langgraph/overview)
 - [LangGraph persistence](https://docs.langchain.com/oss/python/langgraph/persistence)
 - [LangChain structured output](https://docs.langchain.com/oss/python/langchain/structured-output)
+- [LangChain Google Gemini integration](https://github.com/langchain-ai/langchain-google/tree/main/libs/genai)
+- [Gemini API model catalog](https://ai.google.dev/gemini-api/docs/models)
 

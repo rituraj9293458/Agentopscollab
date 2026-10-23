@@ -20,8 +20,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-openai = ["langchain-openai>=1.0,<2"]
-anthropic = ["langchain-anthropic>=1.0,<2"]
+gemini = ["langchain-google-genai>=4.4,<5"]
 dev = ["pytest>=8.3,<10", "pytest-cov>=6,<8", "httpx>=0.28,<1", "ruff>=0.9,<1"]
 
 [project.scripts]

@@ -13,8 +13,7 @@ class Settings(BaseSettings):
     database_url: str = (
         "postgresql+psycopg://raceproof:raceproof_dev_only@localhost:55432/raceproof"
     )
-    model_provider: str = "openai"
-    model_name: str = "gpt-5"
+    model_name: str = "gemini-3.8-flash"
     max_repair_attempts: int = Field(default=3, ge=1, le=5)
     schedule_timeout_seconds: float = Field(default=8.0, gt=0, le=60)
     benchmark_runs: int = Field(default=20, ge=3, le=200)

@@ -52,14 +52,14 @@ Deterministic components own scheduling, PostgreSQL execution, invariant evaluat
 - Node.js 20 or newer
 - Git
 - PostgreSQL 15 or newer, either Docker or a local isolated cluster
-- An OpenAI or Anthropic key only for live repair generation
+- A Gemini API key from Google AI Studio only for live repair generation
 
 ## Setup
 
 ```powershell
 python -m venv .venv
 .venv\Scripts\Activate.ps1
-python -m pip install -e ".[dev,openai]"
+python -m pip install -e ".[dev,gemini]"
 Copy-Item .env.example .env
 ```
 
@@ -103,16 +103,16 @@ raceproof run
 
 Without a model key, the graph still inspects and reproduces the failure, then ends as `MODEL_UNAVAILABLE`. This is intentional. It does not substitute a canned repair.
 
-For live OpenAI repair:
+For live Gemini repair:
 
 ```powershell
-$env:RACEPROOF_MODEL_PROVIDER='openai'
-$env:RACEPROOF_MODEL_NAME='gpt-5'
-$env:OPENAI_API_KEY='your-key'
+$env:RACEPROOF_MODEL_NAME='gemini-3.8-flash'
+$env:GEMINI_API_KEY='your-google-ai-studio-key'
 raceproof run
 ```
 
-For Anthropic, install `langchain-anthropic`, set provider/name, and set `ANTHROPIC_API_KEY`.
+`GOOGLE_API_KEY` is accepted as an alternative environment variable. RaceProof uses the
+`langchain-google-genai` integration and the Gemini Developer API, not Vertex AI credentials.
 
 ## Backend and dashboard
 
@@ -163,7 +163,7 @@ The repository checkout is the baseline and is not modified by the repair loop.
 
 ## Configuration
 
-See `.env.example`. Important settings are the database URL, provider/model, attempt cap, schedule timeout, benchmark sample count, and observed performance regression multiplier.
+See `.env.example`. Important settings are the database URL, Gemini model, attempt cap, schedule timeout, benchmark sample count, and observed performance regression multiplier.
 
 ## Known limitations
 

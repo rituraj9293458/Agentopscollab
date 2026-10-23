@@ -7,7 +7,7 @@ from pathlib import Path
 
 from raceproof.config import get_settings
 from raceproof.contracts import RunEvent, RunReport
-from raceproof.model import LangChainRepairModel
+from raceproof.model import GeminiRepairModel
 from raceproof.workflow import RaceProofRunner
 
 
@@ -39,7 +39,7 @@ class RunService:
 
         def execute() -> None:
             settings = get_settings()
-            model = LangChainRepairModel(settings.model_provider, settings.model_name)
+            model = GeminiRepairModel(settings.model_name)
             try:
                 active.status = "running"
                 runner = RaceProofRunner(self.repository_root, settings, model, listener)

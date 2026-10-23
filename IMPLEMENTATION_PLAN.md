@@ -1,20 +1,20 @@
-# Six-Hour Implementation Plan for Two Developers
+# Reusable Platform Delivery Plan
 
 ## Outcome target
 
-At six hours, the demo must reliably reproduce one real PostgreSQL oversell, show the trace and failed invariant, and run one model-authored candidate through protected deterministic verification. If live repair is unavailable, the demo must stop honestly after reproduction and show the evidence.
+The demo must reliably load two external applications, reproduce both defects on real PostgreSQL, show generic traces and failed invariants, and run model-authored candidates through protected deterministic verification. If LLM access is unavailable, use the deterministic reproduction command for evidence and show that the autonomous workflow stops honestly as `MODEL_UNAVAILABLE`.
 
 ## Work split
 
-Developer A owns PostgreSQL, scheduling, invariant, candidate execution, and tests. Developer B owns the LangGraph/model boundary, FastAPI event model, dashboard, and integration. Both review the security boundary and final demo script.
+Developer A owns PostgreSQL, scheduling, invariant, candidate execution, and tests. Developer B owns both distinct LangChain agents, their LangGraph handoff, FastAPI events, dashboard, and integration. Both review the security boundary and final demo script.
 
 | Time | Developer A | Developer B | Go/no-go evidence |
 | --- | --- | --- | --- |
-| 0:00 to 0:30 | Compose, schema, vulnerable function | Skeleton graph, contracts, UI shell | Database health query succeeds |
-| 0:30 to 1:30 | Two-session controlled schedule | SSE run service and live stage UI | 10 of 10 oversell replays fail invariant |
-| 1:30 to 2:15 | Reset and executable oracle | Transaction lane visualization | UI shows real A/B events and final rows |
-| 2:15 to 3:15 | Candidate workspace and subprocess verifier | Structured model proposal and prompt | Generated diff passes guard or gives exact rejection |
-| 3:15 to 4:15 | Exact/adapted replay and gate aggregation | Conditional repair/replan graph | Safe reference strategy passes, vulnerable source fails |
+| 0:00 to 0:30 | Target schema and adapters | Versioned contract and registry | Both contracts validate |
+| 0:30 to 1:30 | Declarative two-session scheduler | Generic SSE service and target UI | Both targets fail their own invariant |
+| 1:30 to 2:15 | Reset and executable oracles | Dynamic transaction lanes and evidence | UI changes entirely from target metadata |
+| 2:15 to 3:15 | Candidate workspace and subprocess verifier | Investigation tools, hypothesis schema, and handoff | Failed control experiment replans; failure creates artifact |
+| 3:15 to 4:15 | Exact/adapted replay and gate aggregation | Repair tools, diff schema, and repair loop | Failed candidate evidence reaches the next repair attempt |
 | 4:15 to 5:00 | Integration and failure tests | Diff, before/after, limitation UI | Full local test suite passes |
 | 5:00 to 6:00 | Harden timeouts and demo data | Polish, responsive layout, rehearsal | Fresh setup and one recorded end-to-end run |
 
@@ -31,15 +31,15 @@ Developer A owns PostgreSQL, scheduling, invariant, candidate execution, and tes
 ## Optional after the core works
 
 - SQLite graph checkpointer.
-- Additional adjacent schedules.
+- Additional adjacent schedules and actor counts.
 - Lock-wait introspection from `pg_stat_activity`.
-- Second duplicate-operation scenario with a unique constraint.
+- Third idempotency scenario with a unique constraint.
 - Containerized candidate sandbox.
 - Side-by-side syntax-highlighted diff.
 
 ## Highest risks
 
-1. Transaction checkpoints accidentally flush or commit before the intended point.
+1. A target adapter commits outside the intended transaction boundary.
 2. A candidate removes the checkpoint and creates a false pass.
 3. SQLAlchemy module/session state is imported from the baseline instead of the candidate.
 4. LLM output is not a complete applicable diff.
@@ -48,7 +48,7 @@ Developer A owns PostgreSQL, scheduling, invariant, candidate execution, and tes
 
 ## Fallbacks
 
-- If the model provider is unavailable, demonstrate reproduction, `MODEL_UNAVAILABLE`, and the patch contract. Do not replay a canned fix as AI output.
+- If the model provider is unavailable, demonstrate deterministic reproduction with the CLI, then show that the autonomous workflow stops as `MODEL_UNAVAILABLE`. Do not replay a canned hypothesis or fix as AI output.
 - If adapted scheduling cannot classify the candidate, return `UNVERIFIABLE_SCHEDULE` and show the missing semantic anchor.
 - If Docker is unavailable, start an isolated local PostgreSQL cluster bound to loopback.
 - If SSE reconnect behavior becomes unstable, poll `GET /api/runs/{id}` while keeping the same real event list.

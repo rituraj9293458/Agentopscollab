@@ -18,24 +18,34 @@ class ConcurrencyInspector(ast.NodeVisitor):
             for child in ast.walk(node)
         )
         has_if = any(isinstance(child, ast.If) for child in ast.walk(node))
-        has_subtract_assignment = any(
-            isinstance(child, ast.Assign)
-            and isinstance(child.value, ast.BinOp)
-            and isinstance(child.value.op, ast.Sub)
+        has_derived_write = any(
+            isinstance(child, (ast.Assign, ast.AugAssign))
+            and (
+                isinstance(child, ast.AugAssign)
+                or (isinstance(child, ast.Assign) and isinstance(child.value, ast.BinOp))
+            )
             for child in ast.walk(node)
         )
-        has_order_insert = any(
-            isinstance(child, ast.Call) and _call_name(child.func) == "Order"
+        has_dependent_insert = any(
+            isinstance(child, ast.Call)
+            and isinstance(child.func, ast.Attribute)
+            and child.func.attr in {"add", "add_all"}
+            for child in ast.walk(node)
+        )
+        has_flush = any(
+            isinstance(child, ast.Call) and _call_name(child.func) == "flush"
             for child in ast.walk(node)
         )
         if has_select:
             source_signals.append("row read")
         if has_if:
             source_signals.append("check then act")
-        if has_subtract_assignment:
-            source_signals.append("absolute update derived from observed value")
-        if has_order_insert:
+        if has_derived_write:
+            source_signals.append("write derived from observed value")
+        if has_dependent_insert:
             source_signals.append("dependent insert")
+        if has_flush:
+            source_signals.append("transactional flush")
         if len(source_signals) >= 3:
             self.findings.append(
                 StaticFinding(

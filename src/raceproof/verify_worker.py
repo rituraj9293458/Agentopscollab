@@ -6,76 +6,89 @@ import subprocess
 import sys
 from pathlib import Path
 
-from raceproof.contracts import VerificationReport
+from raceproof.contracts import ScheduleStatus, VerificationReport
 from raceproof.database import create_database_engine
 from raceproof.events import EventRecorder
-from raceproof.sample.inventory import purchase_inventory
-from raceproof.scheduler import ControlledScheduler, benchmark_operation
+from raceproof.scheduler import ControlledScheduler, benchmark_schedule, outcomes_match
+from raceproof.target import load_adapter, load_target_config
 
 
-def operation_shape(source: str) -> str:
-    if "available_stock > 0" in source and "update(" in source:
-        return "atomic_claim"
-    if "with_for_update" in source:
-        return "row_lock"
-    if '"after_read"' in source or "'after_read'" in source:
-        return "stale_read"
-    return "unknown"
+def _run_regression(root: Path, target) -> subprocess.CompletedProcess[str]:
+    command = target.config.verification.regression
+    argv = list(command.argv)
+    if argv[0] in {"python", "python3"}:
+        argv[0] = sys.executable
+    python_paths = [str(root / path) for path in target.config.python_paths]
+    env = {
+        **os.environ,
+        "PYTHONPATH": os.pathsep.join([*python_paths, os.environ.get("PYTHONPATH", "")]),
+    }
+    return subprocess.run(
+        argv,
+        cwd=root / command.cwd,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=command.timeout_seconds,
+        shell=False,
+        check=False,
+    )
 
 
 def verify(
     database_url: str,
     root: Path,
-    replays: int,
-    benchmark_runs: int,
+    config_relative_path: str,
     baseline_p95_ms: float | None = None,
-    performance_limit: float = 2.5,
 ) -> VerificationReport:
-    source_path = root / "src" / "raceproof" / "sample" / "inventory.py"
-    source = source_path.read_text(encoding="utf-8")
-    shape = operation_shape(source)
+    target = load_target_config(root / config_relative_path, allowed_roots=[root])
+    adapter = load_adapter(target)
+    config = target.config
     engine = create_database_engine(database_url)
-    results = []
-    replay_mode = "exact" if shape == "stale_read" else "adapted"
-    for _ in range(replays):
-        recorder = EventRecorder()
-        scheduler = ControlledScheduler(engine, recorder)
-        if replay_mode == "exact":
-            result = scheduler.reproduce_stale_read(purchase_inventory)
-        else:
-            result = scheduler.parallel_claim(purchase_inventory)
-        results.append(result)
-    schedule_valid = shape in {"stale_read", "atomic_claim", "row_lock"}
-    invariants_pass = all(
-        result.invariant is not None and result.invariant.passed for result in results
-    )
-    outcomes_valid = all(
-        list(result.actor_outcomes.values()).count("accepted") == 1
-        and list(result.actor_outcomes.values()).count("rejected") == 1
-        for result in results
-    )
-    completed = all(result.completed for result in results)
-    regression = subprocess.run(
-        [
-            sys.executable,
-            "-m",
-            "pytest",
-            "-q",
-            "tests/test_contracts.py",
-            "tests/test_patching.py",
-            "tests/test_verification_shape.py",
-        ],
-        cwd=root,
-        env={**os.environ, "PYTHONPATH": str(root / "src")},
-        capture_output=True,
-        text=True,
-        timeout=120,
-        shell=False,
-        check=False,
-    )
-    performance = benchmark_operation(engine, purchase_inventory, benchmark_runs)
+    selected_results = []
+    attempted_modes: list[str] = []
+    try:
+        for _ in range(config.verification.replay_count):
+            selected = None
+            for index, schedule in enumerate(config.verification_schedules):
+                recorder = EventRecorder()
+                result = ControlledScheduler(engine, recorder).execute(
+                    adapter,
+                    config.actors,
+                    schedule,
+                    exact=index == 0,
+                )
+                attempted_modes.append(f"{schedule.name}:{result.status.value}")
+                if result.status == ScheduleStatus.COMPLETED:
+                    selected = result
+                    break
+            if selected is not None:
+                selected_results.append(selected)
+
+        schedule_valid = len(selected_results) == config.verification.replay_count
+        invariants_pass = schedule_valid and all(
+            result.invariant is not None and result.invariant.passed for result in selected_results
+        )
+        outcomes_valid = schedule_valid and all(
+            outcomes_match(result.actor_outcomes, config.verification.allowed_outcomes)
+            for result in selected_results
+        )
+        completed = schedule_valid and all(result.completed for result in selected_results)
+        regression = _run_regression(root, target)
+        performance = benchmark_schedule(
+            engine,
+            adapter,
+            config.actors,
+            config.verification_schedules[-1],
+            config.verification.benchmark_runs,
+        )
+    finally:
+        engine.dispose()
+
     performance_acceptable = (
-        baseline_p95_ms is None or performance.p95_latency_ms <= baseline_p95_ms * performance_limit
+        baseline_p95_ms is None
+        or performance.p95_latency_ms
+        <= baseline_p95_ms * config.verification.performance_regression_limit
     )
     gates = {
         "schedule_semantically_valid": schedule_valid,
@@ -84,20 +97,24 @@ def verify(
         "allowed_outcomes": outcomes_valid,
         "regression_tests": regression.returncode == 0,
         "no_transaction_errors": performance.errors == 0,
+        "benchmark_schedules_completed": performance.schedule_failures == 0,
         "no_deadlocks": performance.deadlocks == 0,
         "performance_within_configured_limit": performance_acceptable,
     }
+    replay_modes = sorted({"exact" if result.exact else "adapted" for result in selected_results})
     return VerificationReport(
         passed=all(gates.values()),
-        replay_mode=replay_mode,
+        replay_mode="+".join(replay_modes) if replay_modes else "unverifiable",
         gates=gates,
-        schedule_results=results,
+        schedule_results=selected_results,
         regression_output=(regression.stdout + regression.stderr)[-8000:],
         performance=performance,
         limitations=[
-            f"Operation classified as {shape} from bounded Python/SQLAlchemy source analysis.",
-            "Finite replays cover only the named two-actor inventory schedules.",
+            f"Target: {config.name}.",
+            "Finite replays cover only the developer-declared schedules.",
+            "A missing original checkpoint triggers a declared adapted schedule, never a pass.",
             "Performance values are local observations, not production capacity claims.",
+            "Schedule attempts: " + ", ".join(attempted_modes),
             (
                 "Candidate p95 was compared with the same local baseline and configured multiplier."
                 if baseline_p95_ms is not None
@@ -111,18 +128,14 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--database-url", required=True)
     parser.add_argument("--root", type=Path, default=Path.cwd())
-    parser.add_argument("--replays", type=int, default=5)
-    parser.add_argument("--benchmark-runs", type=int, default=10)
+    parser.add_argument("--config", default="raceproof.json")
     parser.add_argument("--baseline-p95-ms", type=float)
-    parser.add_argument("--performance-limit", type=float, default=2.5)
     args = parser.parse_args()
     report = verify(
         args.database_url,
         args.root.resolve(),
-        args.replays,
-        args.benchmark_runs,
+        args.config,
         args.baseline_p95_ms,
-        args.performance_limit,
     )
     print(report.model_dump_json())
     return 0 if report.passed else 2

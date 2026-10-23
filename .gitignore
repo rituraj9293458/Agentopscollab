@@ -6,6 +6,7 @@ __pycache__/
 .coverage
 htmlcov/
 .raceproof/
+.raceproof-pg/
 artifacts/
 frontend/node_modules/
 frontend/dist/

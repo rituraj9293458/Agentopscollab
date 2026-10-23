@@ -1,70 +1,86 @@
 # Experiment Log
 
-## E1: PostgreSQL `READ COMMITTED` stale absolute write
+## E1: Inventory stale write
 
-**Question:** Can two SQLAlchemy sessions deterministically create two orders from one available item?
+**Question:** Can two independent SQLAlchemy transactions consume one observed unit?
 
-**Method:** Keep both transactions open after their initial read. Release A through commit, observe its commit in the coordinator, then release B. B writes `observed_stock - 1` from its Python value.
+**Method:** The target contract waits for both actors at `after_read`, releases A through commit, then releases B with its stale Python object.
 
-**Expected evidence:** Both actors report accepted, orders are `2`, stock is `0`, and the invariant fails.
+**Executable oracle:** `final_stock >= 0 and final_stock + committed_orders == initial_stock`.
 
-**Why this is plausible:** PostgreSQL `READ COMMITTED` gives each plain `SELECT` a statement-time snapshot. SQLAlchemy sessions are mutable transaction state and must not be shared across threads. Each actor therefore uses its own session.
+**Expected failure evidence:** Both actors return `accepted`, two orders commit, final stock is zero, and conservation fails.
 
-**Status:** Implemented. Runtime results are recorded in generated reports, not hardcoded here.
+**Status:** Reproduced on real PostgreSQL through the generic scheduler.
 
-## E2: Timing luck versus controlled checkpoints
+## E2: Booking double reservation
 
-**Approach rejected:** Start two threads at nearly the same time and repeat until a race appears.
+**Question:** Does the same engine reproduce a different defect shape in another application?
 
-**Reason:** A random overlap does not prove which schedule occurred and can disappear under logging or load. Semantic checkpoints make the sequence explicit and timeout failures diagnostic.
+**Method:** Each actor checks the booking count for one resource. The schedule holds both after the availability read, commits A, then releases B to insert its stale decision.
+
+**Executable oracle:** `active_bookings_per_resource <= 1`.
+
+**Expected failure evidence:** Both actors return `accepted`, two bookings commit for one resource, and exclusivity fails.
+
+**Status:** Reproduced on real PostgreSQL through the same scheduler and report contracts. Core code contains no booking imports.
 
 ## E3: Missing checkpoint after repair
 
-**Question:** If a repair replaces read/check/write with one conditional `UPDATE`, does the removed `after_read` marker count as success?
+**Question:** Does removal of `after_read` count as a successful exact replay?
 
-**Result:** No. Candidate source is classified into bounded semantic shapes. Atomic claims and row locks receive an adapted two-actor workload. Unknown shapes fail the schedule-validity gate. A missing marker alone never passes verification.
+**Method:** A test adapter completes without emitting the required marker. A generated atomic inventory candidate also removes the stale-read checkpoint.
 
-**Remaining risk:** Source-shape classification is narrow and can reject valid unfamiliar repairs. That is safer than claiming success without a meaningful schedule.
+**Result:** The exact schedule is `INVALID` when actors finish without the checkpoint, or `TIMED_OUT` when locking prevents all actors from reaching it. Neither result is a pass. The verifier proceeds only to a developer-declared adapted schedule.
 
-## E4: Atomic conditional claim
+## E4: Atomic conditional inventory claim
 
-**Hypothesis:** `UPDATE products SET available_stock = available_stock - 1 WHERE id = ? AND available_stock > 0` lets the database arbitrate the claim. Under contention, a waiting updater reevaluates its predicate against the updated row and receives row count zero.
+**Hypothesis:** An update shaped as `UPDATE ... SET stock = stock - 1 WHERE id = ? AND stock > 0` lets PostgreSQL arbitrate one remaining unit.
 
-**Implementation use:** A reference operation exists only to test scheduler and verifier behavior. Live workflow repair still requires a model-authored diff.
+**Method:** A test-only generated proposal is applied through the real diff guard and disposable workspaces. Verification runs exact replay first, then the declared parallel-start fallback when the original marker is absent.
 
-**Acceptance:** One accepted, one rejected, invariant passed, no errors, no deadlocks, and regressions passed across named replays.
+**Acceptance:** Three candidate replays each produce one accepted and one rejected actor, the invariant passes, target regressions pass, no transaction errors or deadlocks are observed, and the local performance gate passes.
 
-## E5: Patch containment
+**Status:** Verified as orchestration evidence. The test double is not represented as a live Gemini result.
 
-**Probes:** Diff to a test file, path traversal, sleeps, subprocess/network additions, malformed diff, syntax failure, and changed-line overflow.
+## E5: Contract validation and isolation
 
-**Expected:** Reject before candidate execution and feed exact errors to the next bounded attempt.
+**Probes:** Unapproved invariant, path traversal, shell operators, protected test edits, inserted sleeps, unknown checkpoints, and candidate mutation.
 
-**Limitation:** Static policy is defense in depth, not a secure sandbox.
+**Expected:** Reject invalid contracts or diffs before candidate execution. Keep the original target source byte-for-byte unchanged after a verified candidate run.
+
+**Status:** Covered by unit and PostgreSQL integration tests.
 
 ## E6: Model unavailable
 
-**Question:** What happens with no provider key?
+**Question:** What happens without provider credentials?
 
-**Expected:** Inspection and real reproduction still run. Repair ends as `MODEL_UNAVAILABLE`; no patch or verified result is invented.
+**Result:** Both bundled targets still run inspection and real reproduction. Repair terminates as `MODEL_UNAVAILABLE`; no canned patch or verified result is invented.
 
-## E7: Persistence choice
+## E7: Two-agent architecture
 
-LangGraph's in-memory checkpointer is enough for one active local run, while JSONL captures durable research history. Official guidance notes that `InMemorySaver` does not survive restarts and recommends a persistent saver for production. A hackathon implementation can add `SqliteSaver` after core evidence is stable.
+**Decision:** Use one Investigation Agent and one Repair Agent with distinct prompts, tools, and structured outputs.
 
-## Sources checked
+**Reason:** Hypothesis formation and patch authorship are separate reasoning problems with different permissions. A compact confirmed artifact prevents unlimited conversational coupling. Static inspection, PostgreSQL execution, invariant evaluation, patch policy, regression tests, and measurements remain deterministic, so no supervisor or verifier agent is needed.
 
-- [PostgreSQL transaction isolation](https://www.postgresql.org/docs/current/transaction-iso.html)
-- [SQLAlchemy session basics and thread model](https://docs.sqlalchemy.org/en/20/orm/session_basics.html)
-- [LangGraph orchestration](https://docs.langchain.com/oss/python/langgraph/overview)
-- [LangGraph persistence](https://docs.langchain.com/oss/python/langgraph/persistence)
-- [LangChain structured output](https://docs.langchain.com/oss/python/langchain/structured-output)
+**Test evidence:** Structured model doubles confirm source and schema reach the Investigator, a serial negative control triggers investigation replanning, a confirmed failure creates the handoff, a failed candidate verification reaches the next Repair attempt, protected edits remain rejected, and backend agent events identify their real producer. These tests validate orchestration, not live Gemini quality.
 
-## Future experiments
+## Current validation record
 
-- Add a duplicate-refund scenario using a unique key plus `ON CONFLICT DO NOTHING`; do not imply exactly-once external provider effects.
-- Compare row locking, atomic update, and optimistic versioning under fixed contention distributions.
-- Test serializable write-skew cases with complete transaction retry.
+The refactor is accepted only when all of these succeed locally:
+
+```powershell
+python -m ruff check src tests examples
+python -m pytest -q -m "not integration"
+python -m pytest -q -m integration
+npm --prefix frontend run build
+```
+
+Integration tests require an isolated PostgreSQL database and are skipped if it is unavailable. Any final report must distinguish a skipped environment from a tested one.
+
+## Next experiments
+
+- Add an idempotency target using a unique key and `ON CONFLICT DO NOTHING` without claiming exactly-once external effects.
+- Compare row locking, atomic updates, and optimistic versioning under fixed contention distributions.
+- Add serializable write-skew cases with complete transaction retries.
 - Record lock waits and SQLSTATEs from PostgreSQL system views.
-- Run adversarial generated patches in an ephemeral no-network container.
-
+- Execute generated candidates in ephemeral no-network containers.

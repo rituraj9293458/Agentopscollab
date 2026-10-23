@@ -11,14 +11,16 @@ from raceproof.contracts import VerificationReport
 
 def verify_candidate(
     candidate: Path,
+    config_relative_path: str,
     database_url: str,
-    replays: int = 5,
-    benchmark_runs: int = 10,
     baseline_p95_ms: float | None = None,
-    performance_limit: float = 2.5,
     timeout_seconds: int = 180,
 ) -> VerificationReport:
-    env = {**os.environ, "PYTHONPATH": str(candidate / "src")}
+    engine_src = Path(__file__).resolve().parents[1]
+    env = {
+        **os.environ,
+        "PYTHONPATH": os.pathsep.join([str(engine_src), str(candidate / "src")]),
+    }
     completed = subprocess.run(
         [
             sys.executable,
@@ -28,13 +30,9 @@ def verify_candidate(
             database_url,
             "--root",
             str(candidate),
-            "--replays",
-            str(replays),
-            "--benchmark-runs",
-            str(benchmark_runs),
+            "--config",
+            config_relative_path,
             *(["--baseline-p95-ms", str(baseline_p95_ms)] if baseline_p95_ms is not None else []),
-            "--performance-limit",
-            str(performance_limit),
         ],
         cwd=candidate,
         env=env,

@@ -1,33 +1,35 @@
 from __future__ import annotations
 
 import json
+import os
 import threading
 import uuid
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, ClassVar, Literal, TypedDict
+from typing import Any, Literal, TypedDict
 
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.graph import END, START, StateGraph
-from sqlalchemy.dialects import postgresql
-from sqlalchemy.schema import CreateTable
 
 from raceproof.config import Settings
 from raceproof.contracts import (
     EventKind,
     FailureBundle,
     FinalStatus,
+    InvestigationArtifact,
+    InvestigationAttempt,
+    InvestigationContext,
     RepairAttempt,
     RunReport,
+    ScheduleSpec,
 )
 from raceproof.database import create_database_engine
 from raceproof.events import EventRecorder
 from raceproof.inspection import inspect_python_file
-from raceproof.model import RepairModel
+from raceproof.model import InvestigationModel, RepairModel
 from raceproof.patching import PatchGuard, WorkspaceManager, canonical_diff
-from raceproof.sample.inventory import purchase_inventory
-from raceproof.sample.models import Base
-from raceproof.scheduler import ControlledScheduler, benchmark_operation
+from raceproof.scheduler import ControlledScheduler, benchmark_schedule
+from raceproof.target import LoadedTarget, load_adapter
 from raceproof.verification import verify_candidate
 
 
@@ -35,11 +37,16 @@ class WorkflowState(TypedDict, total=False):
     run_id: str
     status: str
     findings: list[dict[str, Any]]
+    source_files: dict[str, str]
+    schema_ddl: str
+    investigation_attempts: list[dict[str, Any]]
+    selected_experiment: str
+    experiment_result: dict[str, Any]
+    investigation_artifact: dict[str, Any]
     baseline: dict[str, Any]
     baseline_performance: dict[str, Any]
     attempts: list[dict[str, Any]]
     attempt_number: int
-    failure_bundle: dict[str, Any]
     candidate_path: str
     proposal: dict[str, Any]
     final_diff: str
@@ -47,28 +54,35 @@ class WorkflowState(TypedDict, total=False):
 
 
 class RaceProofRunner:
-    editable_paths: ClassVar[set[str]] = {"src/raceproof/sample/inventory.py"}
-    protected_prefixes: ClassVar[tuple[str, ...]] = (
-        "tests/",
-        "src/raceproof/scheduler.py",
-        "src/raceproof/invariants.py",
-    )
+    """LangGraph orchestration for two LLM agents and deterministic execution tools."""
 
     def __init__(
         self,
-        repository_root: Path,
+        engine_root: Path,
+        target: LoadedTarget,
         settings: Settings,
+        investigation_model: InvestigationModel,
         repair_model: RepairModel,
         listener: Any | None = None,
     ) -> None:
-        self.repository_root = repository_root.resolve()
+        self.engine_root = engine_root.resolve()
+        self.target = target
         self.settings = settings
+        self.database_url = os.environ.get(target.config.database_url_env, settings.database_url)
+        self.investigation_model = investigation_model
         self.repair_model = repair_model
         self.recorder = EventRecorder(listener)
-        self.workspace = WorkspaceManager(
-            self.repository_root, self.repository_root / settings.artifact_dir
+        artifact_root = (self.engine_root / settings.artifact_dir).resolve()
+        self.workspace = WorkspaceManager(target.repository_root, artifact_root)
+        protected = tuple(
+            sorted(
+                {
+                    Path(path).as_posix().rstrip("/")
+                    for path in target.config.operation.protected_paths
+                }
+            )
         )
-        self.guard = PatchGuard(self.editable_paths, self.protected_prefixes)
+        self.guard = PatchGuard(set(target.config.operation.editable_paths), protected)
         self._history_lock = threading.Lock()
         self.graph = self._build_graph()
 
@@ -76,151 +90,432 @@ class RaceProofRunner:
         self.recorder.add(EventKind.STAGE, action, action, detail=detail)
 
     def _persist(self, run_id: str, node: str, state: WorkflowState) -> None:
-        output = self.repository_root / self.settings.artifact_dir / "runs" / run_id
+        output = self.engine_root / self.settings.artifact_dir / "runs" / run_id
         output.mkdir(parents=True, exist_ok=True)
-        record = {
-            "timestamp": datetime.now(UTC).isoformat(),
-            "node": node,
-            "state": state,
-        }
+        record = {"timestamp": datetime.now(UTC).isoformat(), "node": node, "state": state}
         with (
             self._history_lock,
             (output / "state-history.jsonl").open("a", encoding="utf-8") as stream,
         ):
             stream.write(json.dumps(record, default=str) + "\n")
 
+    def _experiments(self) -> list[ScheduleSpec]:
+        items = [
+            self.target.config.reproduction_schedule,
+            *self.target.config.investigation_schedules,
+        ]
+        unique: dict[str, ScheduleSpec] = {}
+        for item in items:
+            unique.setdefault(item.name, item)
+        return list(unique.values())
+
+    def _load_target(self, state: WorkflowState) -> WorkflowState:
+        self._stage("load_target", {"target_id": self.target.config.id})
+        update: WorkflowState = {"status": FinalStatus.SUSPECTED.value}
+        self._persist(state["run_id"], "load_target", update)
+        return update
+
     def _inspect(self, state: WorkflowState) -> WorkflowState:
-        self._stage("inspect")
-        path = self.repository_root / "src" / "raceproof" / "sample" / "inventory.py"
-        findings = inspect_python_file(path, self.repository_root)
+        self._stage("inspect", {"target_id": self.target.config.id})
+        findings = []
+        source_files: dict[str, str] = {}
+        for relative in self.target.config.operation.source_files:
+            path = self.target.repository_root / relative
+            source_files[relative] = path.read_text(encoding="utf-8")
+            if path.suffix == ".py":
+                findings.extend(inspect_python_file(path, self.target.repository_root))
         update: WorkflowState = {
-            "findings": [finding.model_dump(mode="json") for finding in findings]
+            "findings": [finding.model_dump(mode="json") for finding in findings],
+            "source_files": source_files,
+            "schema_ddl": load_adapter(self.target).schema_ddl(),
         }
         self._persist(state["run_id"], "inspect", update)
         return update
 
-    def _hypothesize(self, state: WorkflowState) -> WorkflowState:
-        self._stage("hypothesize", {"finding_count": len(state.get("findings", []))})
-        update: WorkflowState = {"status": FinalStatus.SUSPECTED.value}
-        self._persist(state["run_id"], "hypothesize", update)
+    def _investigation_context(self, state: WorkflowState) -> InvestigationContext:
+        experiments = self._experiments()
+        checkpoints = sorted(
+            {
+                action.checkpoint
+                for experiment in experiments
+                for action in experiment.actions
+                if action.checkpoint
+            }
+        )
+        return InvestigationContext(
+            target_id=self.target.config.id,
+            target_name=self.target.config.name,
+            target_operation=self.target.config.operation.callable,
+            source_files=state["source_files"],
+            schema_ddl=state["schema_ddl"],
+            findings=state.get("findings", []),
+            transaction_boundaries=[
+                "Each actor executes through TargetAdapter.run_actor.",
+                "Each bundled adapter opens one independent sessionmaker.begin transaction.",
+                "Commit or rollback occurs only when the adapter transaction context exits.",
+            ],
+            checkpoints=checkpoints,
+            available_experiments=experiments,
+            invariant=self.target.config.invariant,
+            prior_attempts=state.get("investigation_attempts", []),
+            repair_evidence_requests=[
+                request
+                for attempt in state.get("attempts", [])
+                for request in (attempt.get("proposal") or {}).get(
+                    "additional_evidence_request", []
+                )
+            ],
+        )
+
+    def _investigate(self, state: WorkflowState) -> WorkflowState:
+        number = len(state.get("investigation_attempts", [])) + 1
+        self._stage("investigate", {"agent": "Investigation Agent", "attempt": number})
+        available, reason = self.investigation_model.available()
+        if not available:
+            update: WorkflowState = {
+                "status": FinalStatus.MODEL_UNAVAILABLE.value,
+                "terminal_reason": f"Investigation Agent unavailable: {reason}",
+            }
+            self._persist(state["run_id"], "investigation_agent", update)
+            return update
+
+        try:
+            decision = self.investigation_model.investigate(self._investigation_context(state))
+        except Exception as exc:  # noqa: BLE001 - agent failure becomes terminal evidence
+            update = {
+                "status": FinalStatus.EXECUTION_ERROR.value,
+                "terminal_reason": f"Investigation Agent failed: {type(exc).__name__}: {exc}",
+            }
+            self._persist(state["run_id"], "investigation_agent", update)
+            return update
+        known = {experiment.name for experiment in self._experiments()}
+        failure_reason = None
+        selected = decision.experiment_name
+        if selected not in known:
+            failure_reason = f"Investigation Agent selected unknown experiment: {selected}"
+            selected = ""
+        if decision.unresolved:
+            failure_reason = "Investigation Agent could not justify another experiment"
+            selected = ""
+        attempt = InvestigationAttempt(
+            number=number,
+            decision=decision,
+            failure_reason=failure_reason,
+        )
+        attempts = [
+            *state.get("investigation_attempts", []),
+            attempt.model_dump(mode="json"),
+        ]
+        self.recorder.add(
+            EventKind.AGENT,
+            "investigate",
+            "hypothesis",
+            actor="Investigation Agent",
+            detail=decision.model_dump(mode="json"),
+        )
+        exhausted = number >= self.settings.max_investigation_attempts
+        update = {
+            "investigation_attempts": attempts,
+            "selected_experiment": selected,
+            "status": (
+                FinalStatus.UNCONFIRMED.value
+                if (decision.unresolved or (failure_reason and exhausted))
+                else FinalStatus.SUSPECTED.value
+            ),
+            "terminal_reason": failure_reason or "",
+        }
+        self._persist(state["run_id"], "investigation_agent", update)
         return update
 
-    def _execute(self, state: WorkflowState) -> WorkflowState:
-        self._stage("schedule")
-        engine = create_database_engine(self.settings.database_url, self.recorder)
+    def _route_after_investigation(
+        self, state: WorkflowState
+    ) -> Literal["execute_experiment", "investigate", "finalize"]:
+        if state.get("status") in {
+            FinalStatus.MODEL_UNAVAILABLE.value,
+            FinalStatus.UNCONFIRMED.value,
+            FinalStatus.EXECUTION_ERROR.value,
+        }:
+            return "finalize"
+        if state.get("selected_experiment"):
+            return "execute_experiment"
+        return "investigate"
+
+    def _execute_experiment(self, state: WorkflowState) -> WorkflowState:
+        schedule = next(
+            item for item in self._experiments() if item.name == state["selected_experiment"]
+        )
+        self._stage(
+            "execute_experiment",
+            {"agent": "Investigation Agent", "schedule": schedule.name},
+        )
+        engine = create_database_engine(self.database_url, self.recorder)
         try:
             result = ControlledScheduler(
                 engine, self.recorder, self.settings.schedule_timeout_seconds
-            ).reproduce_stale_read(purchase_inventory)
-            baseline_performance = benchmark_operation(
-                engine,
-                purchase_inventory,
-                self.settings.benchmark_runs,
-                self.settings.schedule_timeout_seconds,
+            ).execute(
+                load_adapter(self.target),
+                self.target.config.actors,
+                schedule,
+                exact=True,
             )
         finally:
             engine.dispose()
-        reproduced = bool(
-            result.completed and result.exact and result.invariant and not result.invariant.passed
-        )
-        status = FinalStatus.REPRODUCED.value if reproduced else FinalStatus.EXECUTION_ERROR.value
-        update: WorkflowState = {
-            "baseline": result.model_dump(mode="json"),
-            "baseline_performance": baseline_performance.model_dump(mode="json"),
-            "status": status,
-            "terminal_reason": ""
-            if reproduced
-            else "controlled schedule did not reproduce the invariant failure",
-        }
-        self._persist(state["run_id"], "execute", update)
+        update: WorkflowState = {"experiment_result": result.model_dump(mode="json")}
+        self._persist(state["run_id"], "execute_experiment", update)
         return update
 
-    def _route_after_execute(self, state: WorkflowState) -> Literal["repair", "finalize"]:
-        return "repair" if state.get("status") == FinalStatus.REPRODUCED.value else "finalize"
+    def _observe(self, state: WorkflowState) -> WorkflowState:
+        self._stage("observe", {"agent": "Investigation Agent"})
+        attempts = [dict(item) for item in state["investigation_attempts"]]
+        attempts[-1]["result"] = state["experiment_result"]
+        result = state["experiment_result"]
+        reproduced = bool(result["completed"] and result["reproduced_failure"])
+        update: WorkflowState = {"investigation_attempts": attempts}
+        if reproduced:
+            interpretation_state = dict(state)
+            interpretation_state["investigation_attempts"] = attempts
+            try:
+                conclusion = self.investigation_model.interpret(
+                    self._investigation_context(interpretation_state)
+                )
+            except Exception as exc:  # noqa: BLE001 - agent failure becomes terminal evidence
+                update.update(
+                    {
+                        "status": FinalStatus.EXECUTION_ERROR.value,
+                        "terminal_reason": (
+                            f"Investigation Agent observation failed: {type(exc).__name__}: {exc}"
+                        ),
+                    }
+                )
+                self._persist(state["run_id"], "observe", update)
+                return update
+            if not conclusion.repair_ready:
+                if len(attempts) < self.settings.max_investigation_attempts:
+                    update.update(
+                        {
+                            "status": FinalStatus.SUSPECTED.value,
+                            "terminal_reason": "Investigation Agent requested additional evidence",
+                        }
+                    )
+                else:
+                    update.update(
+                        {
+                            "status": FinalStatus.UNRESOLVED.value,
+                            "terminal_reason": (
+                                "Confirmed invariant failure, but investigation evidence was "
+                                "insufficient for repair at the attempt cap"
+                            ),
+                        }
+                    )
+                self._persist(state["run_id"], "observe", update)
+                return update
+            artifact = InvestigationArtifact(
+                target_id=self.target.config.id,
+                target_operation=self.target.config.operation.callable,
+                confirmed_vulnerability=True,
+                relevant_source_spans=state.get("findings", []),
+                reproduced_schedule=result,
+                sql_trace=[
+                    event for event in result["events"] if event["kind"] == EventKind.SQL.value
+                ],
+                violated_invariant=result["invariant"],
+                final_database_state=result["invariant"]["evidence"],
+                hypothesized_root_cause=conclusion.root_cause,
+                execution_interpretation=conclusion.execution_interpretation,
+                evidence_references=[
+                    f"schedule:{result['schedule_name']}",
+                    f"invariant:{result['invariant']['name']}",
+                    *[
+                        f"source:{finding['file']}:{finding['line_start']}"
+                        for finding in state.get("findings", [])
+                    ],
+                    *conclusion.evidence_references,
+                ],
+            )
+            engine = create_database_engine(self.database_url)
+            try:
+                performance = benchmark_schedule(
+                    engine,
+                    load_adapter(self.target),
+                    self.target.config.actors,
+                    self.target.config.verification_schedules[-1],
+                    self.target.config.verification.benchmark_runs,
+                    self.settings.schedule_timeout_seconds,
+                )
+            finally:
+                engine.dispose()
+            update.update(
+                {
+                    "status": FinalStatus.REPRODUCED.value,
+                    "baseline": result,
+                    "baseline_performance": performance.model_dump(mode="json"),
+                    "investigation_artifact": artifact.model_dump(mode="json"),
+                    "terminal_reason": "",
+                }
+            )
+            self.recorder.add(
+                EventKind.AGENT,
+                "observe",
+                "confirmed_handoff",
+                actor="Investigation Agent",
+                detail={
+                    "target_id": artifact.target_id,
+                    "root_cause": artifact.hypothesized_root_cause,
+                    "execution_interpretation": artifact.execution_interpretation,
+                    "invariant": artifact.violated_invariant.model_dump(mode="json"),
+                },
+            )
+        elif len(attempts) >= self.settings.max_investigation_attempts:
+            update.update(
+                {
+                    "status": FinalStatus.UNCONFIRMED.value,
+                    "terminal_reason": "Investigation attempt cap reached without an invariant violation",
+                }
+            )
+        else:
+            update.update(
+                {
+                    "status": FinalStatus.SUSPECTED.value,
+                    "terminal_reason": "Experiment did not confirm the hypothesis; replanning",
+                }
+            )
+        self._persist(state["run_id"], "observe", update)
+        return update
+
+    def _route_after_observe(
+        self, state: WorkflowState
+    ) -> Literal["repair_agent", "investigate", "finalize"]:
+        if state.get("status") == FinalStatus.REPRODUCED.value:
+            return "repair_agent"
+        if state.get("status") == FinalStatus.SUSPECTED.value:
+            return "investigate"
+        return "finalize"
 
     def _build_bundle(self, state: WorkflowState) -> FailureBundle:
-        source_path = self.repository_root / "src" / "raceproof" / "sample" / "inventory.py"
-        models_path = self.repository_root / "src" / "raceproof" / "sample" / "models.py"
-        ddl = "\n\n".join(
-            str(CreateTable(table).compile(dialect=postgresql.dialect()))
-            for table in Base.metadata.sorted_tables
-        )
+        config = self.target.config
         return FailureBundle(
-            target_operation="raceproof.sample.inventory.purchase_inventory",
-            source_files={
-                "src/raceproof/sample/inventory.py": source_path.read_text(encoding="utf-8"),
-                "src/raceproof/sample/models.py": models_path.read_text(encoding="utf-8"),
-            },
-            schema_ddl=ddl,
+            target_id=config.id,
+            target_operation=config.operation.callable,
+            source_files=state["source_files"],
+            schema_ddl=state["schema_ddl"],
             findings=state.get("findings", []),
             reproduced_schedule=state["baseline"],
-            business_invariant="successful_orders <= initial_stock AND final_stock = initial_stock - successful_orders",
-            allowed_outcomes={"accepted": 1, "rejected": 1, "errors": 0},
-            editable_paths=sorted(self.editable_paths),
-            protected_paths=list(self.protected_prefixes),
+            business_invariant=config.invariant.description,
+            allowed_outcomes=config.verification.allowed_outcomes,
+            editable_paths=config.operation.editable_paths,
+            protected_paths=config.operation.protected_paths,
+            investigation_artifact=state["investigation_artifact"],
             previous_attempts=state.get("attempts", []),
         )
 
-    def _repair(self, state: WorkflowState) -> WorkflowState:
-        attempt_number = state.get("attempt_number", 0) + 1
-        self._stage("repair", {"attempt": attempt_number})
+    def _repair_agent(self, state: WorkflowState) -> WorkflowState:
+        number = state.get("attempt_number", 0) + 1
+        self._stage("repair", {"agent": "Repair Agent", "attempt": number})
         available, reason = self.repair_model.available()
         if not available:
             update: WorkflowState = {
-                "attempt_number": attempt_number,
+                "attempt_number": number,
                 "status": FinalStatus.MODEL_UNAVAILABLE.value,
-                "terminal_reason": reason,
+                "terminal_reason": f"Repair Agent unavailable: {reason}",
             }
-            self._persist(state["run_id"], "repair", update)
+            self._persist(state["run_id"], "repair_agent", update)
             return update
-        bundle = self._build_bundle(state)
-        proposal = self.repair_model.propose(bundle)
-        attempt = RepairAttempt(number=attempt_number, proposal=proposal)
-        if proposal.cannot_repair:
-            attempt.failure_reason = "model reported that it cannot produce a justified repair"
+        try:
+            proposal = self.repair_model.propose(self._build_bundle(state))
+        except Exception as exc:  # noqa: BLE001 - agent failure becomes terminal evidence
             update = {
-                "attempt_number": attempt_number,
-                "attempts": [*state.get("attempts", []), attempt.model_dump(mode="json")],
-                "status": FinalStatus.UNRESOLVED.value,
-                "terminal_reason": attempt.failure_reason,
+                "attempt_number": number,
+                "status": FinalStatus.EXECUTION_ERROR.value,
+                "terminal_reason": f"Repair Agent failed: {type(exc).__name__}: {exc}",
             }
-            self._persist(state["run_id"], "repair", update)
+            self._persist(state["run_id"], "repair_agent", update)
             return update
-        candidate = self.workspace.create_candidate(attempt_number)
-        validation = self.guard.apply(candidate, proposal.unified_diff)
-        attempt.patch_validation = validation
-        if not validation.accepted:
-            attempt.failure_reason = "; ".join(validation.errors)
-        update = {
-            "attempt_number": attempt_number,
-            "failure_bundle": bundle.model_dump(mode="json"),
+        attempt = RepairAttempt(number=number, proposal=proposal)
+        investigation_available = (
+            len(state.get("investigation_attempts", [])) < self.settings.max_investigation_attempts
+        )
+        if proposal.request_additional_investigation and investigation_available:
+            attempt.failure_reason = "Repair Agent requested additional investigation evidence"
+        elif proposal.cannot_repair or proposal.request_additional_investigation:
+            attempt.failure_reason = "Repair Agent reported insufficient evidence for a safe repair"
+        attempts = [*state.get("attempts", []), attempt.model_dump(mode="json")]
+        self.recorder.add(
+            EventKind.AGENT,
+            "repair",
+            "repair_strategy",
+            actor="Repair Agent",
+            detail={
+                "attempt": number,
+                "strategy": proposal.strategy,
+                "diagnosis": proposal.diagnosis,
+                "cannot_repair": proposal.cannot_repair,
+                "request_additional_investigation": proposal.request_additional_investigation,
+                "additional_evidence_request": proposal.additional_evidence_request,
+            },
+        )
+        update: WorkflowState = {
+            "attempt_number": number,
+            "attempts": attempts,
             "proposal": proposal.model_dump(mode="json"),
-            "candidate_path": str(candidate),
-            "attempts": [*state.get("attempts", []), attempt.model_dump(mode="json")],
+            "candidate_path": "",
+            "status": (
+                FinalStatus.SUSPECTED.value
+                if proposal.request_additional_investigation and investigation_available
+                else (
+                    FinalStatus.UNRESOLVED.value
+                    if proposal.cannot_repair or proposal.request_additional_investigation
+                    else FinalStatus.REPRODUCED.value
+                )
+            ),
+            "terminal_reason": attempt.failure_reason or "",
+        }
+        self._persist(state["run_id"], "repair_agent", update)
+        return update
+
+    def _route_after_repair_agent(
+        self, state: WorkflowState
+    ) -> Literal["apply_patch", "investigate", "repair_agent", "finalize"]:
+        if state.get("status") in {
+            FinalStatus.MODEL_UNAVAILABLE.value,
+            FinalStatus.EXECUTION_ERROR.value,
+        }:
+            return "finalize"
+        if state.get("status") == FinalStatus.SUSPECTED.value:
+            return "investigate"
+        if not state.get("terminal_reason"):
+            return "apply_patch"
+        if state.get("attempt_number", 0) < self.settings.max_repair_attempts:
+            return "repair_agent"
+        return "finalize"
+
+    def _apply_patch(self, state: WorkflowState) -> WorkflowState:
+        self._stage("apply_patch", {"attempt": state["attempt_number"]})
+        candidate = self.workspace.create_candidate(state["attempt_number"])
+        validation = self.guard.apply(candidate, state["proposal"]["unified_diff"])
+        attempts = [dict(item) for item in state["attempts"]]
+        attempts[-1]["patch_validation"] = validation.model_dump(mode="json")
+        reason = "" if validation.accepted else "; ".join(validation.errors)
+        if reason:
+            attempts[-1]["failure_reason"] = reason
+        update: WorkflowState = {
+            "attempts": attempts,
+            "candidate_path": str(candidate) if validation.accepted else "",
             "status": FinalStatus.REPRODUCED.value
             if validation.accepted
             else FinalStatus.UNRESOLVED.value,
-            "terminal_reason": ""
-            if validation.accepted
-            else (attempt.failure_reason or "patch rejected"),
+            "terminal_reason": reason,
         }
-        self._persist(state["run_id"], "repair", update)
+        self._persist(state["run_id"], "apply_patch", update)
         return update
 
-    def _route_after_repair(self, state: WorkflowState) -> Literal["verify", "retry", "finalize"]:
-        if state.get("status") == FinalStatus.MODEL_UNAVAILABLE.value:
-            return "finalize"
-        if state.get("candidate_path") and not state.get("terminal_reason"):
+    def _route_after_apply(
+        self, state: WorkflowState
+    ) -> Literal["verify", "repair_agent", "finalize"]:
+        if state.get("candidate_path"):
             return "verify"
         if state.get("attempt_number", 0) < self.settings.max_repair_attempts:
-            return "retry"
+            return "repair_agent"
         return "finalize"
-
-    def _retry(self, state: WorkflowState) -> WorkflowState:
-        self._stage("replan", {"next_attempt": state.get("attempt_number", 0) + 1})
-        update: WorkflowState = {"status": FinalStatus.REPRODUCED.value, "terminal_reason": ""}
-        self._persist(state["run_id"], "replan", update)
-        return update
 
     def _verify(self, state: WorkflowState) -> WorkflowState:
         self._stage("verify", {"attempt": state["attempt_number"]})
@@ -228,17 +523,29 @@ class RaceProofRunner:
         run_copy = self.workspace.create_run_copy(candidate, state["attempt_number"])
         report = verify_candidate(
             run_copy,
-            self.settings.database_url,
-            replays=5,
-            benchmark_runs=self.settings.benchmark_runs,
+            self.target.config_relative_path,
+            self.database_url,
             baseline_p95_ms=state.get("baseline_performance", {}).get("p95_latency_ms"),
-            performance_limit=self.settings.performance_regression_limit,
+            timeout_seconds=max(
+                180, self.target.config.verification.regression.timeout_seconds + 60
+            ),
         )
         attempts = [dict(item) for item in state["attempts"]]
         attempts[-1]["verification"] = report.model_dump(mode="json")
+        self.recorder.add(
+            EventKind.AGENT,
+            "verify",
+            "verification_feedback",
+            actor="Repair Agent",
+            detail={
+                "attempt": state["attempt_number"],
+                "passed": report.passed,
+                "gates": report.gates,
+            },
+        )
         if report.passed:
             diff = canonical_diff(
-                self.repository_root,
+                self.target.repository_root,
                 candidate,
                 attempts[-1]["patch_validation"]["changed_paths"],
             )
@@ -246,14 +553,14 @@ class RaceProofRunner:
             reason = ""
         else:
             failed = [name for name, passed in report.gates.items() if not passed]
-            attempts[-1]["failure_reason"] = "failed verification gates: " + ", ".join(failed)
+            reason = "failed verification gates: " + ", ".join(failed)
+            attempts[-1]["failure_reason"] = reason
             diff = ""
             status = (
                 FinalStatus.UNVERIFIABLE_SCHEDULE.value
                 if not report.gates.get("schedule_semantically_valid", False)
                 else FinalStatus.UNRESOLVED.value
             )
-            reason = attempts[-1]["failure_reason"]
         update: WorkflowState = {
             "attempts": attempts,
             "status": status,
@@ -263,11 +570,11 @@ class RaceProofRunner:
         self._persist(state["run_id"], "verify", update)
         return update
 
-    def _route_after_verify(self, state: WorkflowState) -> Literal["retry", "finalize"]:
+    def _route_after_verify(self, state: WorkflowState) -> Literal["repair_agent", "finalize"]:
         if state.get("status") == FinalStatus.VERIFIED_CANDIDATE.value:
             return "finalize"
         if state.get("attempt_number", 0) < self.settings.max_repair_attempts:
-            return "retry"
+            return "repair_agent"
         return "finalize"
 
     def _finalize(self, state: WorkflowState) -> WorkflowState:
@@ -277,19 +584,23 @@ class RaceProofRunner:
 
     def _build_graph(self):
         graph = StateGraph(WorkflowState)
+        graph.add_node("load_target", self._load_target)
         graph.add_node("inspect", self._inspect)
-        graph.add_node("hypothesize", self._hypothesize)
-        graph.add_node("execute", self._execute)
-        graph.add_node("repair", self._repair)
-        graph.add_node("retry", self._retry)
+        graph.add_node("investigate", self._investigate)
+        graph.add_node("execute_experiment", self._execute_experiment)
+        graph.add_node("observe", self._observe)
+        graph.add_node("repair_agent", self._repair_agent)
+        graph.add_node("apply_patch", self._apply_patch)
         graph.add_node("verify", self._verify)
         graph.add_node("finalize", self._finalize)
-        graph.add_edge(START, "inspect")
-        graph.add_edge("inspect", "hypothesize")
-        graph.add_edge("hypothesize", "execute")
-        graph.add_conditional_edges("execute", self._route_after_execute)
-        graph.add_conditional_edges("repair", self._route_after_repair)
-        graph.add_edge("retry", "repair")
+        graph.add_edge(START, "load_target")
+        graph.add_edge("load_target", "inspect")
+        graph.add_edge("inspect", "investigate")
+        graph.add_conditional_edges("investigate", self._route_after_investigation)
+        graph.add_edge("execute_experiment", "observe")
+        graph.add_conditional_edges("observe", self._route_after_observe)
+        graph.add_conditional_edges("repair_agent", self._route_after_repair_agent)
+        graph.add_conditional_edges("apply_patch", self._route_after_apply)
         graph.add_conditional_edges("verify", self._route_after_verify)
         graph.add_edge("finalize", END)
         return graph.compile(checkpointer=InMemorySaver())
@@ -299,30 +610,39 @@ class RaceProofRunner:
         initial: WorkflowState = {
             "run_id": run_id,
             "status": FinalStatus.SUSPECTED.value,
+            "investigation_attempts": [],
             "attempts": [],
             "attempt_number": 0,
         }
         final = self.graph.invoke(
             initial,
-            config={"configurable": {"thread_id": run_id}, "recursion_limit": 30},
+            config={"configurable": {"thread_id": run_id}, "recursion_limit": 40},
         )
+        config = self.target.config
         report = RunReport(
             run_id=run_id,
             finished_at=datetime.now(UTC),
-            target_operation="raceproof.sample.inventory.purchase_inventory",
+            target_id=config.id,
+            target_name=config.name,
+            target_operation=config.operation.callable,
+            invariant_name=config.invariant.name,
+            invariant_description=config.invariant.description,
             status=FinalStatus(final["status"]),
             findings=final.get("findings", []),
+            investigation_attempts=final.get("investigation_attempts", []),
+            investigation_artifact=final.get("investigation_artifact"),
             baseline=final.get("baseline"),
             attempts=final.get("attempts", []),
             final_diff=final.get("final_diff") or None,
             events=self.recorder.snapshot(),
             limitations=[
-                "The implemented detector and scheduler target synchronous Python, SQLAlchemy 2.x, and PostgreSQL.",
+                *config.limitations,
+                "Investigation and repair reasoning require configured LLM access.",
                 "Verification covers named finite schedules and is not a proof of race freedom.",
                 final.get("terminal_reason", ""),
             ],
         )
-        output = self.repository_root / self.settings.artifact_dir / "runs" / run_id
+        output = self.engine_root / self.settings.artifact_dir / "runs" / run_id
         output.mkdir(parents=True, exist_ok=True)
         (output / "report.json").write_text(report.model_dump_json(indent=2), encoding="utf-8")
         if report.final_diff:

@@ -1,124 +1,159 @@
 # RaceProof Architecture
 
-## Trust model
+## Boundary and trust model
 
-RaceProof treats model output as an untrusted proposal. The central boundary is:
+RaceProof is an engine plus a validated application contract. Domain behavior stays with the target application.
 
-| Capability | Owner | Pass/fail authority |
+| Capability | Owner | Pass or fail authority |
 | --- | --- | --- |
-| Source prioritization and diagnosis | LLM plus static evidence | None |
-| Repair source authorship | LLM | None |
-| Schedule execution | Deterministic Python and PostgreSQL | Execution evidence |
-| Business invariant | Approved SQL/Python oracle | Yes |
-| Patch path and syntax policy | Deterministic guard | Yes |
-| Regression and performance gates | Pytest and measured execution | Yes |
-| Candidate acceptance | Deterministic aggregate plus human | Yes |
+| Hypothesis formation and experiment selection | Investigation Agent plus static evidence | None |
+| Candidate diagnosis and source authorship | Repair Agent | None |
+| Target operation and state reset | Application adapter | Execution only |
+| Checkpoint schedule | Validated target contract and deterministic engine | Yes |
+| Business invariant | Developer-approved application adapter | Yes |
+| Patch paths and syntax | Deterministic guard | Yes |
+| Regression and performance gates | Declared command and measured execution | Yes |
+| Candidate promotion | Aggregate gates plus human review | Yes |
 
-The product reports `SUSPECTED`, `REPRODUCED`, `VERIFIED_CANDIDATE`, `UNRESOLVED`, `MODEL_UNAVAILABLE`, `UNVERIFIABLE_SCHEDULE`, or `EXECUTION_ERROR`. A verified candidate still requires human approval.
+The engine reports `SUSPECTED`, `REPRODUCED`, `VERIFIED_CANDIDATE`, `UNRESOLVED`, `MODEL_UNAVAILABLE`, `UNVERIFIABLE_SCHEDULE`, or `EXECUTION_ERROR`.
 
-## Components
-
-### Inspection
-
-`inspection.py` walks the Python AST and looks for a bounded transaction shape: a row read, check-then-act branch, dependent insert, and absolute update derived from an observed value. A static finding is a hypothesis, never a reproduced defect.
-
-### Database and event capture
-
-`database.py` creates a SQLAlchemy 2.x engine at PostgreSQL `READ COMMITTED`. Every actor owns a separate session and connection lifecycle. An engine event listener records real SQL with thread-local actor attribution. Parameters are intentionally excluded from the dashboard event to reduce accidental secret or PII exposure.
-
-### Scheduler
-
-`ControlledScheduler.reproduce_stale_read` uses thread events rather than timing luck. Each operation calls the semantic `after_read` checkpoint while its transaction remains open. The coordinator releases A, waits for its commit event, then releases B. The final query is evaluated only after both workers finish.
-
-The candidate verifier classifies a bounded set of semantic operation shapes. If a repair removes `after_read`, it does not count a missing checkpoint as success. Atomic conditional updates and row-lock strategies use an adapted two-actor workload. Unknown shapes fail `schedule_semantically_valid`.
-
-### Invariant
-
-The inventory oracle requires both:
+## Package structure
 
 ```text
-successful_orders <= initial_stock
-final_stock = initial_stock - successful_orders
+src/raceproof/
+  contracts.py       validated engine and target schemas
+  target.py          safe loader, registry, and adapter interface
+  inspection.py      bounded generic Python AST signals
+  scheduler.py       declarative actor and checkpoint executor
+  database.py        SQLAlchemy engine, sessions, SQL attribution
+  workflow.py        bounded LangGraph control flow
+  patching.py        isolated workspaces and diff containment
+  verification.py    child-process boundary
+  verify_worker.py   deterministic candidate gates
+  api.py             generic target and run endpoints
+
+examples/
+  inventory_app/     application, adapter, contract, tests
+  booking_app/       application, adapter, contract, tests
 ```
 
-The LLM cannot change this code because scheduler, invariant, tests, and fixtures are protected paths.
+No module under `src/raceproof` imports either example's models or operation.
 
-### Repair model
+## Validated target loading
 
-`GeminiRepairModel` initializes `ChatGoogleGenerativeAI` only when `GEMINI_API_KEY` or `GOOGLE_API_KEY` and the integration package exist. `PatchProposal` is a Pydantic schema containing diagnosis, strategy, assumptions, a complete unified diff, expected SQL shape, anchor hint, residual risks, and `cannot_repair`.
+`TargetConfig` is a versioned Pydantic schema. It requires at least two unique actors, an explicitly approved invariant, a reproduction schedule, optional investigation controls, one or more verification schedules, allowed outcomes, and a shell-free regression command. Every schedule actor must exist.
 
-The model receives exact source, models, schema description, actor trace, final rows, invariant result, allowed outcomes, editable paths, and prior failed attempts. Secrets and environment contents are not included.
+`load_target_config` resolves the repository and checks all declared paths. Absolute paths and `..` traversal are rejected. Required adapters, source files, and editable files must exist. API-discovered targets must remain under the configured examples registry. CLI users explicitly select a config.
 
-### Patch containment
+`load_adapter` imports a single application-owned bridge through a unique module name. The bridge must implement `TargetAdapter`. It receives the resolved repository and immutable validated config.
 
-Each attempt starts from a fresh copied baseline:
+## Application adapter
+
+The adapter has four responsibilities:
+
+1. Reset only its disposable schema and seed deterministic state.
+2. Execute one actor operation in an independent SQLAlchemy transaction.
+3. Evaluate the named approved invariant and return generic evidence.
+4. Provide schema DDL for the failure bundle.
+
+The contract supplies actor inputs, so the engine never assumes product IDs, resource IDs, order tables, stock fields, or result column names.
+
+## Scheduler semantics
+
+`ControlledScheduler.execute` derives gates from `ScheduleSpec` actions:
+
+- `wait_checkpoint`
+- `release`
+- `wait_completion`
+- `release_all`
+
+Actor threads call the adapter with a checkpoint callback. Each actor owns a separate transaction and session. The engine records checkpoint, transaction, SQL, invariant, and error events.
+
+The exact reproduction schedules for both examples hold A and B after their application read, release A through commit, then release B. This produces stale write behavior for inventory and a double insert for booking.
+
+If a candidate removes or relocates a checkpoint, the original schedule becomes `INVALID` or `TIMED_OUT`. Verification may then try the next schedule only if that schedule was already declared by the developer. Current targets declare an adapted parallel-start schedule at the complete-operation boundary. No source classifier silently invents a schedule.
+
+## Static inspection
+
+`inspection.py` searches Python functions for generic concurrency-risk signals such as row reads, check-then-act branches, writes derived from observations, dependent inserts, and transactional flushes. A high-signal match produces only `SUSPECTED`. Runtime PostgreSQL execution and an invariant failure are required for `REPRODUCED`.
+
+## Investigation Agent
+
+The Investigation Agent is a LangChain tool-calling agent with its own system prompt and `InvestigationDecision` structured output. Its tools can read approved source, inspect schema DDL, list transaction boundaries, list synchronization checkpoints, list approved experiments, and select one controlled experiment. It cannot read arbitrary files, generate a patch, or claim execution results.
+
+LangGraph executes the selected schedule outside the agent. If the invariant does not fail, the exact `ScheduleResult` is appended to the next `InvestigationContext`. The agent can revise its hypothesis until `max_investigation_attempts` is reached. Failure to confirm ends as `UNCONFIRMED`.
+
+## Structured handoff
+
+A confirmed PostgreSQL invariant violation produces `InvestigationArtifact`. It contains the target operation, relevant source spans, reproduced schedule, actual SQL events, violated invariant, final evidence state, hypothesized root cause, and evidence references. The Repair Agent receives this bounded artifact, not the Investigation Agent's message history.
+
+If the Repair Agent identifies a specific evidence gap, `PatchProposal` can carry `request_additional_investigation` plus a bounded evidence request. LangGraph routes back to the Investigation Agent only while its independent attempt budget remains. The request becomes tool-readable context; it does not create an unstructured agent conversation.
+
+## Repair Agent and Gemini
+
+The Repair Agent is a second LangChain tool-calling agent with a different system prompt, tools, and `PatchProposal` output. After reproduction, it receives:
+
+- target ID and importable operation;
+- configured source files and schema DDL;
+- static findings;
+- the exact schedule result, SQL-attributed events, actor outcomes, and invariant evidence;
+- the approved invariant description and allowed outcome counts;
+- editable and protected paths;
+- prior failed patch and verification attempts.
+
+Its tools read the handoff, editable source, schema, patch policy, and verification feedback. They do not expose arbitrary files or pass authority. `PatchProposal` contains diagnosis, strategy, assumptions, complete unified diff, expected SQL shape, optional schedule hint, residual risks, and `cannot_repair`.
+
+## Patch containment and isolation
 
 ```text
-repository baseline (unchanged)
-  artifacts/workspaces/attempt-N/candidate  model diff applied here
-  artifacts/workspaces/attempt-N/run        disposable execution copy
+target repository baseline, unchanged
+  engine artifacts/workspaces/attempt-N/candidate
+  engine artifacts/workspaces/attempt-N/run
 ```
 
-The guard requires Git diff syntax, a one-file allowlist, no path traversal, a changed-line cap, no scheduling markers, no sleeps, and no process or network additions. It runs `git apply --check`, applies without a shell, parses Python AST, and runs `compileall`. The final diff is recomputed from baseline and clean candidate files so run instrumentation cannot leak.
+Every attempt starts from a fresh baseline copy. `PatchGuard` enforces the target's editable allowlist and protected prefixes, rejects traversal and selected dangerous additions, caps changed lines, runs `git apply --check`, parses Python, and compiles the target `src` tree. Verification runs against a second disposable copy in a child process. The final diff is recomputed from baseline and candidate.
 
-### Verification
+## Verification gates
 
-The worker is a separate Python process with the candidate `src` first on `PYTHONPATH`. It resets the sample schema before each schedule, executes five controlled or adapted replays, checks allowed outcomes, runs non-integration regressions, checks errors and deadlocks, and records a small local benchmark.
+For each replay, the worker attempts configured schedules in order. It selects the first schedule that completes. A completed exact replay that still violates the invariant is a failed candidate and does not fall through to an easier schedule.
 
-The current gates are:
+All named gates must pass:
 
-- semantic schedule classification is supported;
-- every replay completes;
+- a declared schedule completes for every replay;
 - every approved invariant passes;
-- each two-actor replay produces one accepted and one rejected request;
-- regression tests pass;
-- no transaction errors are observed;
-- no deadlocks are observed.
+- actor outcomes equal the configured multiset;
+- the target-owned regression command passes;
+- the adapted benchmark observes no transaction errors or deadlocks;
+- candidate p95 stays within the configured local multiplier when a baseline exists.
 
-### LangGraph
+The worker is generic. It loads the copied contract and adapter and has no domain-specific source classification.
 
-The compiled graph is:
+## LangGraph and retry behavior
 
 ```text
-START -> inspect -> hypothesize -> execute
-                                  | not reproduced
-                                  v
-                               finalize
-                                  ^
-                                  |
-                        repair -> verify
-                           ^         |
-                           +--replan-+
+START -> load -> inspect -> Investigation Agent -> execute -> observe
+                            ^                            |
+                            +------- not confirmed -----+
+                                                         |
+                                                confirmed handoff
+                                                         v
+                                    Repair Agent -> apply -> verify
+                                         ^                    |
+                                         +---- failed gates ---+
 ```
 
-Conditional edges enforce reproduction before repair, patch acceptance before verification, success before promotion, and the configured attempt limit. An in-memory checkpointer supports active graph state. Every node also appends a durable JSONL state record for research review.
+Conditional edges enforce a confirmed failure before handoff, patch acceptance before verification, success before promotion, and separate investigation and repair attempt caps. Every node appends JSONL state evidence. Failure after a cap ends as `UNCONFIRMED`, `UNRESOLVED`, or `UNVERIFIABLE_SCHEDULE` with exact evidence.
 
-### API and UI
+## Why exactly two agents
 
-FastAPI starts runs in background threads and exposes Server-Sent Events. The React dashboard renders the actual event stream, transaction lanes, invariant state, graph stages, verification gates, observed measurements, and candidate diff. It contains no prerecorded success path.
+The previous prototype had only one Repair Agent after deterministic suspicion and reproduction. The new architecture makes hypothesis formation and experiment selection genuinely LLM-powered while preserving a hard evidence boundary. Investigation and repair require different context, tools, and outputs, so separating them reduces permissions and context growth. A third supervisor agent is unnecessary because LangGraph routes typed state and deterministic results directly.
 
-## Important decisions
+## API and UI
 
-1. **Controlled semantic checkpoints over simultaneous starts.** Reproduction is reliable and the intended interleaving is inspectable.
-2. **Atomic conditional update as a likely inventory strategy.** PostgreSQL reevaluates an `UPDATE` predicate after waiting on a concurrent updater at `READ COMMITTED`, which makes the stock predicate an effective claim boundary. The model must still author the actual candidate.
-3. **One reasoning agent across specialized graph nodes.** Multiple personas add coordination cost without increasing evidence quality for this bounded prototype.
-4. **Fresh attempt from baseline.** Failed patches never accumulate hidden state.
-5. **SSE over WebSockets.** The dashboard needs one-way ordered events and SSE is smaller and easier to debug.
-6. **No automatic merge.** `VERIFIED_CANDIDATE` is evidence for review, not authorization to alter the baseline.
+FastAPI exposes registered target metadata and accepts `target_id` rather than an inventory scenario. Background runs stream ordered Server-Sent Events. The React dashboard derives its title, operation, actors, invariant, evidence fields, and transaction lanes from target metadata and the report.
 
-## Security boundaries and limitations
+## Security and production gaps
 
-The prototype never needs a production database and resets its target schema destructively. Generated code executes in a child process with timeouts, but without OS-level isolation. A stronger implementation must run each candidate in an ephemeral container with CPU, memory, network, filesystem, and database grants restricted. Patch filtering reduces accidental scope expansion but cannot prove code is benign.
+Candidate code is untrusted. A child process, copied workspace, lexical path controls, and timeouts provide containment but not a security sandbox. Production execution needs an ephemeral container or VM with restricted CPU, memory, filesystem, network, and database grants.
 
-The FastAPI run store is not designed for multiple server workers. A production variant needs durable run coordination, authenticated endpoints, access control, secret redaction, artifact retention, and a database allowlist.
-
-## Research basis
-
-- [PostgreSQL transaction isolation](https://www.postgresql.org/docs/current/transaction-iso.html)
-- [SQLAlchemy session basics](https://docs.sqlalchemy.org/en/20/orm/session_basics.html)
-- [LangGraph overview](https://docs.langchain.com/oss/python/langgraph/overview)
-- [LangGraph persistence](https://docs.langchain.com/oss/python/langgraph/persistence)
-- [LangChain structured output](https://docs.langchain.com/oss/python/langchain/structured-output)
-- [LangChain Google Gemini integration](https://github.com/langchain-ai/langchain-google/tree/main/libs/genai)
-- [Gemini API model catalog](https://ai.google.dev/gemini-api/docs/models)
-
+The target adapter can destructively reset its tables, so database URLs require an explicit allowlist in production. The API also needs authentication, authorization, durable queues, artifact retention, secret redaction, and a persistent LangGraph checkpointer.

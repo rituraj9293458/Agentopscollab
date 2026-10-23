@@ -12,14 +12,16 @@ from sqlalchemy import text
 from raceproof.config import get_settings
 from raceproof.database import create_database_engine
 from raceproof.service import RunService
+from raceproof.target import TargetConfigurationError, TargetRegistry
 
 
 class StartRunRequest(BaseModel):
-    scenario: str = "inventory_oversell"
+    target_id: str
 
 
 repository_root = Path(__file__).resolve().parents[2]
 service = RunService(repository_root)
+registry = TargetRegistry(repository_root / "examples")
 app = FastAPI(title="RaceProof API", version="0.1.0")
 app.add_middleware(
     CORSMiddleware,
@@ -47,11 +49,28 @@ def health() -> dict[str, object]:
 
 @app.post("/api/runs", status_code=202)
 def start_run(request: StartRunRequest) -> dict[str, str]:
-    if request.scenario != "inventory_oversell":
-        raise HTTPException(status_code=422, detail="only inventory_oversell is implemented")
+    try:
+        target = registry.get(request.target_id)
+    except TargetConfigurationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     run_id = uuid.uuid4().hex[:12]
-    service.start(run_id)
+    service.start(run_id, target)
     return {"run_id": run_id, "status": "queued"}
+
+
+@app.get("/api/targets")
+def list_targets() -> list[dict[str, object]]:
+    return [
+        {
+            "id": target.config.id,
+            "name": target.config.name,
+            "description": target.config.description,
+            "operation": target.config.operation.callable,
+            "actors": [actor.id for actor in target.config.actors],
+            "invariant": target.config.invariant.model_dump(mode="json"),
+        }
+        for target in registry.list()
+    ]
 
 
 @app.get("/api/runs/{run_id}")

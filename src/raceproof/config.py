@@ -15,6 +15,7 @@ class Settings(BaseSettings):
     )
     model_name: str = "gemini-3.8-flash"
     max_repair_attempts: int = Field(default=3, ge=1, le=5)
+    max_investigation_attempts: int = Field(default=3, ge=1, le=5)
     schedule_timeout_seconds: float = Field(default=8.0, gt=0, le=60)
     benchmark_runs: int = Field(default=20, ge=3, le=200)
     performance_regression_limit: float = Field(default=2.5, ge=1.0, le=10.0)

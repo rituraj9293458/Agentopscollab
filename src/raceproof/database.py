@@ -5,13 +5,12 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from typing import Any
 
-from sqlalchemy import Engine, create_engine, event, text
+from sqlalchemy import Engine, create_engine, event
 from sqlalchemy.orm import Session, sessionmaker
 
 from raceproof.config import get_settings
 from raceproof.contracts import EventKind
 from raceproof.events import EventRecorder
-from raceproof.sample.models import Base, Product
 
 _actor_context = threading.local()
 
@@ -54,30 +53,11 @@ def session_factory(engine: Engine) -> sessionmaker[Session]:
     return sessionmaker(bind=engine, expire_on_commit=False, autoflush=True)
 
 
-def reset_database(engine: Engine, initial_stock: int = 1) -> None:
-    Base.metadata.drop_all(engine)
-    Base.metadata.create_all(engine)
-    factory = session_factory(engine)
-    with factory.begin() as session:
-        session.add(Product(id=1, sku="DEMO-ONE", available_stock=initial_stock))
-
-
-def read_final_state(engine: Engine) -> tuple[int, int]:
-    with engine.connect() as connection:
-        stock = connection.execute(
-            text("SELECT available_stock FROM products WHERE id = 1")
-        ).scalar_one()
-        orders = connection.execute(
-            text("SELECT count(*) FROM orders WHERE product_id = 1")
-        ).scalar_one()
-    return int(stock), int(orders)
-
-
 @contextmanager
-def actor_session(factory: sessionmaker[Session], actor: str) -> Iterator[Session]:
+def actor_session(engine: Engine, actor: str) -> Iterator[Session]:
     set_sql_actor(actor)
     try:
-        with factory() as session:
+        with session_factory(engine).begin() as session:
             yield session
     finally:
         set_sql_actor(None)

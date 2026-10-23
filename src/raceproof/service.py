@@ -7,7 +7,8 @@ from pathlib import Path
 
 from raceproof.config import get_settings
 from raceproof.contracts import RunEvent, RunReport
-from raceproof.model import GeminiRepairModel
+from raceproof.model import GeminiInvestigationAgent, GeminiRepairAgent
+from raceproof.target import LoadedTarget
 from raceproof.workflow import RaceProofRunner
 
 
@@ -26,8 +27,9 @@ class RunService:
         self.repository_root = repository_root
         self.runs: dict[str, ActiveRun] = {}
         self.lock = threading.Lock()
+        self.execution_lock = threading.Lock()
 
-    def start(self, run_id: str) -> ActiveRun:
+    def start(self, run_id: str, target: LoadedTarget) -> ActiveRun:
         active = ActiveRun(run_id=run_id)
         with self.lock:
             self.runs[run_id] = active
@@ -39,11 +41,20 @@ class RunService:
 
         def execute() -> None:
             settings = get_settings()
-            model = GeminiRepairModel(settings.model_name)
+            investigation_agent = GeminiInvestigationAgent(settings.model_name)
+            repair_agent = GeminiRepairAgent(settings.model_name)
             try:
                 active.status = "running"
-                runner = RaceProofRunner(self.repository_root, settings, model, listener)
-                active.report = runner.run(run_id)
+                runner = RaceProofRunner(
+                    self.repository_root,
+                    target,
+                    settings,
+                    investigation_agent,
+                    repair_agent,
+                    listener,
+                )
+                with self.execution_lock:
+                    active.report = runner.run(run_id)
                 active.status = active.report.status.value
             except Exception as exc:  # noqa: BLE001 - background failure becomes run evidence
                 active.error = f"{type(exc).__name__}: {exc}"

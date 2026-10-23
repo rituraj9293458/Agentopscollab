@@ -5,7 +5,7 @@ from collections.abc import Callable
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from raceproof.sample.models import Order, Product
+from inventory_app.models import Order, Product
 
 Checkpoint = Callable[[str, str], None]
 
@@ -16,15 +16,13 @@ def purchase_inventory(
     actor_id: str,
     checkpoint: Checkpoint,
 ) -> bool:
-    """Deliberately vulnerable read, check, then absolute write operation."""
+    """Intentionally vulnerable read-check-write operation."""
     product = session.scalar(select(Product).where(Product.id == product_id))
-    if product is None or product.available_stock <= 0:
+    if product is None or product.stock < 1:
         return False
-
-    observed_stock = product.available_stock
     checkpoint(actor_id, "after_read")
+    product.stock -= 1
     session.add(Order(product_id=product_id, actor_id=actor_id))
-    product.available_stock = observed_stock - 1
     session.flush()
     checkpoint(actor_id, "after_write")
     return True

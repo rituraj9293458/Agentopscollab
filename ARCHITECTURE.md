@@ -91,6 +91,10 @@ If the Repair Agent identifies a specific evidence gap, `PatchProposal` can carr
 
 ## Repair Agent and Gemini
 
+The two agents have separate model identities and one shared usage ledger. Every underlying chat-model request, including internal tool loops, is counted through a LangChain callback. The ledger enforces global and per-agent request limits before dispatch and records provider-reported input and output tokens. Provider retries are bounded and exponential. Authentication, unavailable model, rate, daily quota, structured output, and local budget failures remain distinct terminal evidence.
+
+Fallback is explicit, disabled by default, and visible in the run report. Only an unavailable primary model or an invalid structured response can route to the configured fallback. LangGraph remains the sole orchestrator; fallback does not introduce another agent.
+
 The Repair Agent is a second LangChain tool-calling agent with a different system prompt, tools, and `PatchProposal` output. After reproduction, it receives:
 
 - target ID and importable operation;
@@ -156,4 +160,4 @@ FastAPI exposes registered target metadata and accepts `target_id` rather than a
 
 Candidate code is untrusted. A child process, copied workspace, lexical path controls, and timeouts provide containment but not a security sandbox. Production execution needs an ephemeral container or VM with restricted CPU, memory, filesystem, network, and database grants.
 
-The target adapter can destructively reset its tables, so database URLs require an explicit allowlist in production. The API also needs authentication, authorization, durable queues, artifact retention, secret redaction, and a persistent LangGraph checkpointer.
+The target adapter can destructively reset its tables. RaceProof therefore rejects non-PostgreSQL URLs and rejects non-local hosts unless `RACEPROOF_ALLOW_NONLOCAL_DATABASE=true` is explicitly set for an isolated test database. The API redacts configured keys and URL passwords from surfaced errors. Production still needs authentication, authorization, durable queues, artifact retention, a stronger secret store, and a persistent LangGraph checkpointer.

@@ -345,5 +345,8 @@ def test_repair_agent_cannot_override_patch_guard_and_retries_are_bounded(
     ).run()
     assert report.status == FinalStatus.UNRESOLVED
     assert repair.calls == 2
-    assert all(not attempt.patch_validation.accepted for attempt in report.attempts)
+    assert report.attempts[0].patch_validation is not None
+    assert not report.attempts[0].patch_validation.accepted
+    assert report.attempts[1].patch_validation is None
+    assert report.attempts[1].failure_reason == "Repair Agent repeated an identical candidate diff"
     assert report.final_diff is None

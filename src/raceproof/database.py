@@ -6,6 +6,7 @@ from contextlib import contextmanager
 from typing import Any
 
 from sqlalchemy import Engine, create_engine, event
+from sqlalchemy.engine import make_url
 from sqlalchemy.orm import Session, sessionmaker
 
 from raceproof.config import get_settings
@@ -20,11 +21,29 @@ def set_sql_actor(actor: str | None) -> None:
 
 
 def create_database_engine(url: str | None = None, recorder: EventRecorder | None = None) -> Engine:
+    settings = get_settings()
+    resolved_url = url or settings.database_url
+    parsed = make_url(resolved_url)
+    if not parsed.drivername.startswith("postgresql"):
+        raise ValueError("RaceProof requires PostgreSQL for executable concurrency evidence")
+    if not settings.allow_nonlocal_database and parsed.host not in {
+        "localhost",
+        "127.0.0.1",
+        "::1",
+        None,
+    }:
+        raise ValueError(
+            "non-local PostgreSQL targets are disabled; set "
+            "RACEPROOF_ALLOW_NONLOCAL_DATABASE=true only for an isolated test database"
+        )
+    if parsed.host == "localhost":
+        resolved_url = parsed.set(host="127.0.0.1").render_as_string(hide_password=False)
     engine = create_engine(
-        url or get_settings().database_url,
+        resolved_url,
         isolation_level="READ COMMITTED",
         pool_pre_ping=True,
         future=True,
+        connect_args={"connect_timeout": 5},
     )
     if recorder is not None:
 

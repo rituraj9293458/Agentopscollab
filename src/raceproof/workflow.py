@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import threading
@@ -29,7 +30,17 @@ from raceproof.inspection import inspect_python_file
 from raceproof.model import InvestigationModel, RepairModel
 from raceproof.patching import PatchGuard, WorkspaceManager, canonical_diff
 from raceproof.scheduler import ControlledScheduler, benchmark_schedule
+from raceproof.security import redact_sensitive
 from raceproof.target import LoadedTarget, load_adapter
+from raceproof.usage import (
+    BudgetExceededError,
+    ModelAuthenticationError,
+    ModelQuotaExceededError,
+    ModelRateLimitError,
+    ModelRuntimeError,
+    UsageLimits,
+    UsageTracker,
+)
 from raceproof.verification import verify_candidate
 
 
@@ -64,6 +75,7 @@ class RaceProofRunner:
         investigation_model: InvestigationModel,
         repair_model: RepairModel,
         listener: Any | None = None,
+        usage_tracker: UsageTracker | None = None,
     ) -> None:
         self.engine_root = engine_root.resolve()
         self.target = target
@@ -71,6 +83,7 @@ class RaceProofRunner:
         self.database_url = os.environ.get(target.config.database_url_env, settings.database_url)
         self.investigation_model = investigation_model
         self.repair_model = repair_model
+        self.usage_tracker = usage_tracker or UsageTracker(UsageLimits())
         self.recorder = EventRecorder(listener)
         artifact_root = (self.engine_root / settings.artifact_dir).resolve()
         self.workspace = WorkspaceManager(target.repository_root, artifact_root)
@@ -88,6 +101,32 @@ class RaceProofRunner:
 
     def _stage(self, action: str, detail: dict[str, Any] | None = None) -> None:
         self.recorder.add(EventKind.STAGE, action, action, detail=detail)
+
+    def _usage_event(self, stage: str) -> None:
+        self.recorder.add(
+            EventKind.USAGE,
+            stage,
+            "model_usage",
+            detail=self.usage_tracker.snapshot().model_dump(mode="json"),
+        )
+
+    @staticmethod
+    def _model_failure(exc: Exception, prefix: str) -> WorkflowState:
+        status = FinalStatus.EXECUTION_ERROR
+        if isinstance(exc, BudgetExceededError):
+            status = FinalStatus.BUDGET_EXCEEDED
+        elif isinstance(exc, ModelAuthenticationError):
+            status = FinalStatus.AUTHENTICATION_ERROR
+        elif isinstance(exc, ModelRateLimitError):
+            status = FinalStatus.RATE_LIMITED
+        elif isinstance(exc, ModelQuotaExceededError):
+            status = FinalStatus.QUOTA_EXCEEDED
+        elif isinstance(exc, ModelRuntimeError) and exc.code == "MODEL_UNAVAILABLE":
+            status = FinalStatus.MODEL_UNAVAILABLE
+        return {
+            "status": status.value,
+            "terminal_reason": redact_sensitive(f"{prefix}: {type(exc).__name__}: {exc}"),
+        }
 
     def _persist(self, run_id: str, node: str, state: WorkflowState) -> None:
         output = self.engine_root / self.settings.artifact_dir / "runs" / run_id
@@ -182,12 +221,11 @@ class RaceProofRunner:
         try:
             decision = self.investigation_model.investigate(self._investigation_context(state))
         except Exception as exc:  # noqa: BLE001 - agent failure becomes terminal evidence
-            update = {
-                "status": FinalStatus.EXECUTION_ERROR.value,
-                "terminal_reason": f"Investigation Agent failed: {type(exc).__name__}: {exc}",
-            }
+            self._usage_event("investigate")
+            update = self._model_failure(exc, "Investigation Agent failed")
             self._persist(state["run_id"], "investigation_agent", update)
             return update
+        self._usage_event("investigate")
         known = {experiment.name for experiment in self._experiments()}
         failure_reason = None
         selected = decision.experiment_name
@@ -234,6 +272,10 @@ class RaceProofRunner:
             FinalStatus.MODEL_UNAVAILABLE.value,
             FinalStatus.UNCONFIRMED.value,
             FinalStatus.EXECUTION_ERROR.value,
+            FinalStatus.BUDGET_EXCEEDED.value,
+            FinalStatus.AUTHENTICATION_ERROR.value,
+            FinalStatus.RATE_LIMITED.value,
+            FinalStatus.QUOTA_EXCEEDED.value,
         }:
             return "finalize"
         if state.get("selected_experiment"):
@@ -279,16 +321,11 @@ class RaceProofRunner:
                     self._investigation_context(interpretation_state)
                 )
             except Exception as exc:  # noqa: BLE001 - agent failure becomes terminal evidence
-                update.update(
-                    {
-                        "status": FinalStatus.EXECUTION_ERROR.value,
-                        "terminal_reason": (
-                            f"Investigation Agent observation failed: {type(exc).__name__}: {exc}"
-                        ),
-                    }
-                )
+                self._usage_event("observe")
+                update.update(self._model_failure(exc, "Investigation Agent observation failed"))
                 self._persist(state["run_id"], "observe", update)
                 return update
+            self._usage_event("observe")
             if not conclusion.repair_ready:
                 if len(attempts) < self.settings.max_investigation_attempts:
                     update.update(
@@ -423,13 +460,14 @@ class RaceProofRunner:
         try:
             proposal = self.repair_model.propose(self._build_bundle(state))
         except Exception as exc:  # noqa: BLE001 - agent failure becomes terminal evidence
+            self._usage_event("repair")
             update = {
                 "attempt_number": number,
-                "status": FinalStatus.EXECUTION_ERROR.value,
-                "terminal_reason": f"Repair Agent failed: {type(exc).__name__}: {exc}",
+                **self._model_failure(exc, "Repair Agent failed"),
             }
             self._persist(state["run_id"], "repair_agent", update)
             return update
+        self._usage_event("repair")
         attempt = RepairAttempt(number=number, proposal=proposal)
         investigation_available = (
             len(state.get("investigation_attempts", [])) < self.settings.max_investigation_attempts
@@ -438,6 +476,26 @@ class RaceProofRunner:
             attempt.failure_reason = "Repair Agent requested additional investigation evidence"
         elif proposal.cannot_repair or proposal.request_additional_investigation:
             attempt.failure_reason = "Repair Agent reported insufficient evidence for a safe repair"
+        normalized_diff = "\n".join(
+            line.rstrip() for line in proposal.unified_diff.strip().splitlines()
+        )
+        diff_hash = hashlib.sha256(normalized_diff.encode()).hexdigest()
+        prior_hashes = {
+            hashlib.sha256(
+                "\n".join(
+                    line.rstrip()
+                    for line in (
+                        ((item.get("proposal") or {}).get("unified_diff") or "")
+                        .strip()
+                        .splitlines()
+                    )
+                ).encode()
+            ).hexdigest()
+            for item in state.get("attempts", [])
+            if (item.get("proposal") or {}).get("unified_diff")
+        }
+        if diff_hash in prior_hashes:
+            attempt.failure_reason = "Repair Agent repeated an identical candidate diff"
         attempts = [*state.get("attempts", []), attempt.model_dump(mode="json")]
         self.recorder.add(
             EventKind.AGENT,
@@ -463,7 +521,7 @@ class RaceProofRunner:
                 if proposal.request_additional_investigation and investigation_available
                 else (
                     FinalStatus.UNRESOLVED.value
-                    if proposal.cannot_repair or proposal.request_additional_investigation
+                    if attempt.failure_reason
                     else FinalStatus.REPRODUCED.value
                 )
             ),
@@ -478,6 +536,10 @@ class RaceProofRunner:
         if state.get("status") in {
             FinalStatus.MODEL_UNAVAILABLE.value,
             FinalStatus.EXECUTION_ERROR.value,
+            FinalStatus.BUDGET_EXCEEDED.value,
+            FinalStatus.AUTHENTICATION_ERROR.value,
+            FinalStatus.RATE_LIMITED.value,
+            FinalStatus.QUOTA_EXCEEDED.value,
         }:
             return "finalize"
         if state.get("status") == FinalStatus.SUSPECTED.value:
@@ -641,6 +703,11 @@ class RaceProofRunner:
                 "Verification covers named finite schedules and is not a proof of race freedom.",
                 final.get("terminal_reason", ""),
             ],
+            investigation_model=self.settings.resolved_investigation_model,
+            repair_model=self.settings.resolved_repair_model,
+            fallback_model=self.settings.fallback_model,
+            fallback_enabled=self.settings.enable_model_fallback,
+            usage=self.usage_tracker.snapshot(),
         )
         output = self.engine_root / self.settings.artifact_dir / "runs" / run_id
         output.mkdir(parents=True, exist_ok=True)

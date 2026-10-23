@@ -8,7 +8,10 @@ from pathlib import Path
 from raceproof.config import get_settings
 from raceproof.contracts import RunEvent, RunReport
 from raceproof.model import GeminiInvestigationAgent, GeminiRepairAgent
+from raceproof.runtime import build_usage_tracker
+from raceproof.security import redact_sensitive
 from raceproof.target import LoadedTarget
+from raceproof.usage import UsageTracker
 from raceproof.workflow import RaceProofRunner
 
 
@@ -20,6 +23,7 @@ class ActiveRun:
     report: RunReport | None = None
     error: str | None = None
     updates: queue.Queue[RunEvent | None] = field(default_factory=queue.Queue)
+    usage_tracker: UsageTracker | None = None
 
 
 class RunService:
@@ -41,8 +45,19 @@ class RunService:
 
         def execute() -> None:
             settings = get_settings()
-            investigation_agent = GeminiInvestigationAgent(settings.model_name)
-            repair_agent = GeminiRepairAgent(settings.model_name)
+            tracker = build_usage_tracker(settings)
+            active.usage_tracker = tracker
+            common = {
+                "usage_tracker": tracker,
+                "fallback_model": settings.fallback_model,
+                "fallback_enabled": settings.enable_model_fallback,
+                "max_retries": settings.model_max_retries,
+                "api_key": settings.gemini_api_key_value,
+            }
+            investigation_agent = GeminiInvestigationAgent(
+                settings.resolved_investigation_model, **common
+            )
+            repair_agent = GeminiRepairAgent(settings.resolved_repair_model, **common)
             try:
                 active.status = "running"
                 runner = RaceProofRunner(
@@ -52,12 +67,13 @@ class RunService:
                     investigation_agent,
                     repair_agent,
                     listener,
+                    tracker,
                 )
                 with self.execution_lock:
                     active.report = runner.run(run_id)
                 active.status = active.report.status.value
             except Exception as exc:  # noqa: BLE001 - background failure becomes run evidence
-                active.error = f"{type(exc).__name__}: {exc}"
+                active.error = redact_sensitive(f"{type(exc).__name__}: {exc}")
                 active.status = "EXECUTION_ERROR"
             finally:
                 active.updates.put(None)

@@ -4,6 +4,8 @@
 
 The demo must reliably load two external applications, reproduce both defects on real PostgreSQL, show generic traces and failed invariants, and run model-authored candidates through protected deterministic verification. If LLM access is unavailable, use the deterministic reproduction command for evidence and show that the autonomous workflow stops honestly as `MODEL_UNAVAILABLE`.
 
+Model completion criteria include separate Investigation and Repair model configuration, opt-in live capability validation, provider-request accounting across internal tool loops, conservative request and token budgets, bounded retries, explicit fallback telemetry, and structured terminal provider failures. A local test suite never substitutes for `raceproof validate-models` when claiming live model compatibility.
+
 ## Work split
 
 Developer A owns PostgreSQL, scheduling, invariant, candidate execution, and tests. Developer B owns both distinct LangChain agents, their LangGraph handoff, FastAPI events, dashboard, and integration. Both review the security boundary and final demo script.

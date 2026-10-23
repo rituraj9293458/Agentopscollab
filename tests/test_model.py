@@ -6,8 +6,25 @@ from raceproof.model import GeminiInvestigationAgent, GeminiRepairAgent
 from raceproof.target import TargetRegistry, load_adapter
 
 
-def test_gemini_is_the_default_model() -> None:
-    assert Settings.model_fields["model_name"].default == "gemini-3.8-flash"
+def test_gemini_roles_have_separate_defaults() -> None:
+    settings = Settings(_env_file=None)
+    assert settings.resolved_investigation_model == "gemini-3.5-flash-lite"
+    assert settings.resolved_repair_model == "gemini-3.1-flash-lite"
+    assert settings.fallback_model == "gemini-3.8-flash"
+    assert settings.enable_model_fallback is False
+
+
+def test_gemini_key_loads_from_dotenv_without_being_serialized(tmp_path) -> None:
+    env_file = tmp_path / ".env"
+    env_file.write_text("GEMINI_API_KEY=local-secret\n", encoding="utf-8")
+    settings = Settings(_env_file=env_file)
+    assert settings.gemini_api_key_value == "local-secret"
+    assert "local-secret" not in str(settings.gemini_api_key)
+
+
+def test_default_dotenv_path_is_project_relative_not_cwd() -> None:
+    env_file = Settings.model_config["env_file"]
+    assert env_file == Path(__file__).resolve().parents[1] / ".env"
 
 
 def test_gemini_model_reports_missing_key(monkeypatch) -> None:

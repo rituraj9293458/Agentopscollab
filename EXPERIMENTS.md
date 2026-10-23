@@ -42,6 +42,10 @@
 
 **Status:** Verified as orchestration evidence. The test double is not represented as a live Gemini result.
 
+### Live Gemini capability probe
+
+`raceproof validate-models` performs a minimal real request to each configured role and requires both a named tool call and a schema-validated response. This is intentionally opt-in because it consumes quota. A missing key, invalid key, unavailable model, rate limit, quota limit, or malformed response is reported as failed evidence. Local tests do not claim that this live experiment passed.
+
 ## E5: Contract validation and isolation
 
 **Probes:** Unapproved invariant, path traversal, shell operators, protected test edits, inserted sleeps, unknown checkpoints, and candidate mutation.

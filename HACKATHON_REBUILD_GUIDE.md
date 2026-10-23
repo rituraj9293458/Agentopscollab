@@ -12,6 +12,7 @@ RaceProof is a reusable, bounded concurrency investigation engine for synchronou
 4. Reproduce booking double reservation with `raceproof reproduce --config examples/booking_app/raceproof.json`.
 5. Open the dashboard, switch targets, and show that operation, actors, invariant, evidence, and lanes change without frontend code changes.
 6. If a Gemini key is configured, show the Investigation Agent hypothesis and handoff followed by the Repair Agent strategy. Otherwise, show honest `MODEL_UNAVAILABLE` behavior.
+7. Run `raceproof model-status` before the demo. Run `raceproof validate-models` only when consuming live quota is intended.
 
 ## Evidence to emphasize
 
@@ -21,6 +22,7 @@ RaceProof is a reusable, bounded concurrency investigation engine for synchronou
 - A model proposal has no pass or fail authority.
 - Missing checkpoints are schedule failures, not success.
 - A candidate is copied, guarded, tested, benchmarked, and reported for review. The original target remains unchanged.
+- The dashboard labels provider-reported tokens, unknown metadata, remaining local budgets, and any explicit fallback use.
 
 ## Architecture choice
 

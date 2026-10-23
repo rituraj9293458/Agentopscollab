@@ -2,9 +2,9 @@ import { useEffect, useMemo, useState } from 'react'
 import {
   Activity, AlertTriangle, ArrowRight, Check, ChevronRight, CircleDot,
   Code2, Database, GitCompare, Loader2, LockKeyhole, Play, ShieldCheck,
-  TerminalSquare, X,
+  TerminalSquare, X, Gauge,
 } from 'lucide-react'
-import type { InvariantResult, RunEvent, RunReport, Target } from './types'
+import type { InvariantResult, ModelStatus, RunEvent, RunReport, Target, UsageSnapshot } from './types'
 
 const API = import.meta.env.VITE_API_URL ?? ''
 const stages = ['load_target', 'inspect', 'investigate', 'execute_experiment', 'observe', 'repair', 'apply_patch', 'verify', 'finalize']
@@ -27,9 +27,11 @@ function App() {
   const [error, setError] = useState<string | null>(null)
   const [targets, setTargets] = useState<Target[]>([])
   const [targetId, setTargetId] = useState('')
+  const [modelStatus, setModelStatus] = useState<ModelStatus | null>(null)
 
   useEffect(() => {
     fetch(`${API}/api/health`).then(r => r.json()).then(data => setHealth(data.postgresql)).catch(() => setHealth(false))
+    fetch(`${API}/api/model-status`).then(r => r.json()).then(setModelStatus).catch(() => setModelStatus(null))
     fetch(`${API}/api/targets`).then(r => r.json()).then((data: Target[]) => {
       setTargets(data); setTargetId(current => current || data[0]?.id || '')
     }).catch(() => setError('Could not load target applications.'))
@@ -81,10 +83,12 @@ function App() {
   const repairAttempt = report?.attempts.at(-1)
   const investigationEvents = events.filter(event => event.kind === 'agent' && event.actor === 'Investigation Agent')
   const repairEvents = events.filter(event => event.kind === 'agent' && event.actor === 'Repair Agent')
+  const liveUsage = [...events].reverse().find(event => event.kind === 'usage')?.detail as UsageSnapshot | undefined
+  const usage = report?.usage ?? liveUsage
   const target = targets.find(item => item.id === targetId)
   const actors = target?.actors ?? []
   const evidence = Object.entries(invariant?.evidence ?? {}).slice(0, 3)
-  const terminal = ['READY', 'MODEL_UNAVAILABLE', 'VERIFIED_CANDIDATE', 'UNRESOLVED', 'UNCONFIRMED', 'EXECUTION_ERROR', 'UNVERIFIABLE_SCHEDULE']
+  const terminal = ['READY', 'MODEL_UNAVAILABLE', 'VERIFIED_CANDIDATE', 'UNRESOLVED', 'UNCONFIRMED', 'EXECUTION_ERROR', 'UNVERIFIABLE_SCHEDULE', 'BUDGET_EXCEEDED', 'AUTHENTICATION_ERROR', 'RATE_LIMITED', 'QUOTA_EXCEEDED']
   const busy = !terminal.includes(status)
 
   return <main>
@@ -146,6 +150,21 @@ function App() {
           {investigation && <div className="agent-summary"><strong>{investigation.decision.concurrency_pattern}</strong><p>{investigation.decision.reasoning_summary}</p><small>Experiment: {investigation.decision.experiment_name} · confidence {Math.round(investigation.decision.confidence * 100)}%</small></div>}
           {!investigationEvents.length && !investigation && <div className="empty-state"><Activity size={24}/><p>Waiting for a structured LLM hypothesis.</p></div>}
         </div>
+      </article>
+
+      <article className="panel activity-panel">
+        <div className="panel-head"><div><span className="kicker">LOCAL COST CONTROL</span><h2>Model usage</h2></div><Gauge size={20}/></div>
+        <div className="invariant-stats">
+          <Metric label="Requests" value={usage?.total_requests ?? 0} accent/>
+          <Metric label="Reported tokens" value={usage ? `${usage.total_tokens}${usage.unknown_token_responses ? '+' : ''}` : '0'}/>
+          <Metric label="Requests left" value={usage?.remaining_request_budget ?? modelStatus?.budgets.max_model_requests ?? '-'}/>
+        </div>
+        <div className="agent-summary">
+          <strong>Investigation: {report?.investigation_model ?? modelStatus?.investigation_model ?? 'loading'}</strong>
+          <p>Repair: {report?.repair_model ?? modelStatus?.repair_model ?? 'loading'}</p>
+          <small>Investigation requests {usage?.requests_by_agent.investigation ?? 0} · Repair requests {usage?.requests_by_agent.repair ?? 0} · Fallback {usage?.fallback_invocations ?? 0}</small>
+        </div>
+        <div className="schedule-caption"><AlertTriangle size={15}/><span>{usage?.unknown_token_responses ? 'Some provider token metadata is unavailable. Token totals are lower bounds.' : usage?.approximate_cost_usd != null ? `Verified configured estimate: $${usage.approximate_cost_usd.toFixed(6)}${usage.cost_is_partial ? ' partial' : ''}` : 'Dollar estimates stay hidden until verified pricing is configured.'}</span></div>
       </article>
 
       <article className="panel activity-panel">

@@ -1,7 +1,7 @@
 export type RunEvent = {
   sequence: number
   timestamp: string
-  kind: 'agent' | 'stage' | 'transaction' | 'checkpoint' | 'sql' | 'invariant' | 'repair' | 'verification' | 'error'
+  kind: 'agent' | 'stage' | 'transaction' | 'checkpoint' | 'sql' | 'invariant' | 'repair' | 'verification' | 'error' | 'usage'
   stage: string
   actor: string | null
   action: string
@@ -85,4 +85,39 @@ export type RunReport = {
     failure_reason?: string
   }>
   limitations: string[]
+  investigation_model: string
+  repair_model: string
+  fallback_model: string | null
+  fallback_enabled: boolean
+  usage: UsageSnapshot
+}
+
+export type UsageSnapshot = {
+  total_requests: number
+  requests_by_agent: Record<string, number>
+  requests_by_model: Record<string, number>
+  input_tokens: number
+  output_tokens: number
+  total_tokens: number
+  unknown_token_responses: number
+  failed_requests: number
+  rate_limit_errors: number
+  fallback_invocations: number
+  remaining_request_budget: number
+  remaining_investigation_budget: number
+  remaining_repair_budget: number
+  remaining_token_budget: number
+  budget_exhausted: boolean
+  warnings: string[]
+  approximate_cost_usd: number | null
+  cost_is_partial: boolean
+}
+
+export type ModelStatus = {
+  key_configured: boolean
+  investigation_model: string
+  repair_model: string
+  fallback_model: string
+  fallback_enabled: boolean
+  budgets: Record<string, number>
 }

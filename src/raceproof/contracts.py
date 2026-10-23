@@ -6,6 +6,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field, model_validator
 
+from raceproof.usage import UsageSnapshot
+
 
 def utc_now() -> datetime:
     return datetime.now(UTC)
@@ -20,6 +22,10 @@ class FinalStatus(StrEnum):
     EXECUTION_ERROR = "EXECUTION_ERROR"
     MODEL_UNAVAILABLE = "MODEL_UNAVAILABLE"
     UNVERIFIABLE_SCHEDULE = "UNVERIFIABLE_SCHEDULE"
+    BUDGET_EXCEEDED = "BUDGET_EXCEEDED"
+    AUTHENTICATION_ERROR = "AUTHENTICATION_ERROR"
+    RATE_LIMITED = "RATE_LIMITED"
+    QUOTA_EXCEEDED = "QUOTA_EXCEEDED"
 
 
 class EventKind(StrEnum):
@@ -32,6 +38,7 @@ class EventKind(StrEnum):
     REPAIR = "repair"
     VERIFICATION = "verification"
     ERROR = "error"
+    USAGE = "usage"
 
 
 class ScheduleStatus(StrEnum):
@@ -320,3 +327,8 @@ class RunReport(BaseModel):
     events: list[RunEvent] = Field(default_factory=list)
     limitations: list[str] = Field(default_factory=list)
     human_approval_required: bool = True
+    investigation_model: str = ""
+    repair_model: str = ""
+    fallback_model: str | None = None
+    fallback_enabled: bool = False
+    usage: UsageSnapshot = Field(default_factory=UsageSnapshot)

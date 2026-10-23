@@ -71,7 +71,7 @@ Each repair attempt starts from the unchanged target repository. A diff can touc
 - Node.js 20 or newer
 - Git
 - PostgreSQL 15 or newer in an isolated disposable database
-- A Gemini API key only for live repair generation
+- A Gemini API key only for live investigation and repair generation
 
 ```powershell
 python -m venv .venv
@@ -80,6 +80,14 @@ python -m pip install -e ".[dev,gemini]"
 Copy-Item .env.example .env
 docker compose up -d postgres
 ```
+
+Open `W:\AgentOpsDemo\.env` and replace only the placeholder in this line:
+
+```dotenv
+GEMINI_API_KEY=placeholder
+```
+
+Keep `.env` local. It is ignored by Git. Restart the backend after changing it, then run `raceproof model-status` for a no-network detection check and `raceproof validate-models` for the opt-in live capability check. Never paste a real key into source, frontend variables, logs, reports, or chat.
 
 If Docker is unavailable on Windows and PostgreSQL 17 is installed:
 
@@ -105,15 +113,29 @@ raceproof reproduce --config examples/inventory_app/raceproof.json
 raceproof reproduce --config examples/booking_app/raceproof.json
 ```
 
+Inspect the configured roles without making a provider request:
+
+```powershell
+raceproof model-status
+```
+
+After placing the key in `.env`, validate both exact model IDs, tool calling, and structured output with an opt-in live request:
+
+```powershell
+raceproof validate-models
+```
+
 Run the bounded workflow:
 
 ```powershell
-$env:RACEPROOF_MODEL_NAME='gemini-3.8-flash'
-$env:GEMINI_API_KEY='your-google-ai-studio-key'
 raceproof run --config examples/inventory_app/raceproof.json
 ```
 
 `GOOGLE_API_KEY` is also accepted. Without a key, the autonomous workflow loads and inspects the target, then terminates honestly as `MODEL_UNAVAILABLE` before claiming LLM investigation. Deterministic reproduction remains available through `raceproof reproduce`.
+
+The default Investigation Agent uses `gemini-3.5-flash-lite`. The Repair Agent uses `gemini-3.1-flash-lite`. Optional fallback uses `gemini-3.8-flash` and is disabled by default. Set `RACEPROOF_ENABLE_MODEL_FALLBACK=true` only after validating it. Fallback occurs only for unavailable-model or structured-output failures. It does not bypass authentication, quota, rate, or local budget failures.
+
+Local budgets default to 12 total provider requests, 5 Investigation Agent requests, 7 Repair Agent requests, and 60,000 provider-reported tokens. Request limits are enforced before a provider call. Token limits are enforced from provider metadata and stop the next call after an overrun. If metadata is missing, the report marks token totals as lower bounds. Dollar estimates are omitted unless a verified pricing table is explicitly configured.
 
 ## API and dashboard
 
@@ -127,6 +149,7 @@ The dashboard fetches generic target metadata and sends only a selected `target_
 
 - `GET /api/targets`: list validated registered targets.
 - `GET /api/health`: report service and PostgreSQL status.
+- `GET /api/model-status`: report model IDs, local budgets, fallback state, and only whether a key is configured.
 - `POST /api/runs`: start `{ "target_id": "inventory_oversell" }`.
 - `GET /api/runs/{run_id}`: status, events, and report.
 - `GET /api/runs/{run_id}/events`: Server-Sent Events stream.
@@ -158,6 +181,7 @@ Runs write to the engine artifact root:
 - The current inspector handles synchronous Python and common SQLAlchemy read, branch, update, insert, and flush shapes.
 - The two bundled targets demonstrate reuse, not universal concurrency analysis.
 - Automated tests use structured model doubles and do not establish successful live Gemini reasoning.
+- The live `validate-models` command is opt-in, consumes provider quota, and was not run unless a real key was configured.
 - Verification covers configured finite schedules and outcomes, not all possible interleavings.
 - Candidate code runs in a child process and disposable workspace, but not an OS sandbox. Use a restricted container or VM for untrusted generated code.
 - The API run store and LangGraph checkpointer are in memory. JSONL and reports are durable, but active runs are not restartable.

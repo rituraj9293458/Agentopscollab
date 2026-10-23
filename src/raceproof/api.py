@@ -11,6 +11,8 @@ from sqlalchemy import text
 
 from raceproof.config import get_settings
 from raceproof.database import create_database_engine
+from raceproof.runtime import model_status
+from raceproof.security import redact_sensitive
 from raceproof.service import RunService
 from raceproof.target import TargetConfigurationError, TargetRegistry
 
@@ -43,8 +45,13 @@ def health() -> dict[str, object]:
         engine.dispose()
         database = True
     except Exception as exc:  # noqa: BLE001 - health must report any driver failure
-        error = f"{type(exc).__name__}: {exc}"
+        error = redact_sensitive(f"{type(exc).__name__}: {exc}")
     return {"service": "ok", "postgresql": database, "database_error": error}
+
+
+@app.get("/api/model-status")
+def get_model_status() -> dict[str, object]:
+    return model_status(get_settings())
 
 
 @app.post("/api/runs", status_code=202)
@@ -84,6 +91,9 @@ def get_run(run_id: str) -> dict[str, object]:
         "events": [event.model_dump(mode="json") for event in active.events],
         "report": active.report.model_dump(mode="json") if active.report else None,
         "error": active.error,
+        "usage": active.usage_tracker.snapshot().model_dump(mode="json")
+        if active.usage_tracker
+        else None,
     }
 
 

@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+import json
 import re
 import uuid
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
@@ -17,6 +18,12 @@ from raceproof.runtime import model_status
 from raceproof.security import redact_sensitive
 from raceproof.service import RunService
 from raceproof.target import TargetConfigurationError, TargetRegistry
+from raceproof.upload import (
+    UploadValidationError,
+    UploadedSource,
+    approve_custom_contract,
+    synthesize_custom_target,
+)
 
 
 class StartRunRequest(BaseModel):
@@ -28,9 +35,16 @@ class ReviewRunRequest(BaseModel):
     comment: str = ""
 
 
+class ContractApprovalRequest(BaseModel):
+    invariant: dict[str, object]
+    actors: list[dict[str, object]]
+    editable_paths: list[str]
+
+
 repository_root = Path(__file__).resolve().parents[2]
 service = RunService(repository_root)
 registry = TargetRegistry(repository_root / "examples")
+custom_target_root = repository_root / "artifacts" / "custom_targets"
 app = FastAPI(title="RaceProof API", version="0.1.0")
 app.add_middleware(
     CORSMiddleware,
@@ -97,6 +111,50 @@ def list_targets() -> list[dict[str, object]]:
         }
         for target in registry.list()
     ]
+
+
+@app.post("/api/targets/custom", status_code=201)
+async def upload_custom_target(
+    files: list[UploadFile] = File(...),
+    entrypoint: str | None = Form(default=None),
+) -> dict[str, object]:
+    try:
+        sources = [
+            UploadedSource(path=file.filename or "", content=await file.read()) for file in files
+        ]
+        return synthesize_custom_target(sources, custom_target_root, entrypoint)
+    except UploadValidationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@app.get("/api/targets/custom/{target_id}")
+def get_custom_target(target_id: str) -> dict[str, object]:
+    try:
+        proposal_path = (custom_target_root / target_id / "proposal.json").resolve()
+        if (
+            not proposal_path.is_relative_to(custom_target_root.resolve())
+            or not proposal_path.is_file()
+        ):
+            raise UploadValidationError("custom target proposal not found")
+        return json.loads(proposal_path.read_text(encoding="utf-8"))
+    except (UploadValidationError, json.JSONDecodeError) as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.post("/api/targets/custom/{target_id}/approve")
+def approve_custom_target(
+    target_id: str, request: ContractApprovalRequest
+) -> dict[str, object]:
+    try:
+        return approve_custom_contract(
+            custom_target_root,
+            target_id,
+            request.invariant,
+            request.actors,
+            request.editable_paths,
+        )
+    except UploadValidationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
 @app.get("/api/runs/{run_id}")

@@ -149,3 +149,32 @@ export type ModelStatus = {
   budgets: Record<string, number>
   langsmith?: { configured: boolean; tracing: boolean; project: string }
 }
+
+export type CustomTargetProposal = {
+  target_id: string
+  status: string
+  analysis_mode: string
+  execution_ready: boolean
+  selected_operation: {
+    entrypoint: string
+    file: string
+    function: string
+    line: number
+    signals: string[]
+    risk: string
+  } | null
+  operation_candidates: Array<Record<string, unknown>>
+  actors: Array<{ id: string; input: Record<string, unknown> }>
+  proposed_invariant: {
+    name: string
+    description: string
+    assertion: string
+    approved: boolean
+  }
+  reproduction_schedule: { name: string; description: string; checkpoints: string[] }
+  editable_paths: string[]
+  protected_paths: string[]
+  warnings: string[]
+  files: string[]
+  execution_blocker: string
+}

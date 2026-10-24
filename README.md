@@ -177,6 +177,19 @@ discard its in-memory run registry. For a backend with reload disabled, use
 
 The dashboard fetches generic target metadata and sends only a selected `target_id` when starting a run.
 
+### Custom code upload MVP
+
+The dashboard can explicitly upload a folder containing `.py` and `.sql` files. RaceProof copies at
+most 200 files and 5 MB into `artifacts/custom_targets/<target_id>`, rejects traversal and unsupported
+paths, and performs AST-only analysis without importing the uploaded modules. It proposes an operation,
+concurrency risk, actor inputs, schedule checkpoints, invariant draft, and editable paths for Gate 1
+human review.
+
+Approved custom contracts currently remain `CONTRACT_APPROVED_ANALYSIS_ONLY`. RaceProof does not execute
+arbitrary uploaded Python on the host. PostgreSQL execution requires a future OS-level container or VM
+sandbox plus an executable application-owned adapter and invariant. Bundled validated targets continue to
+support the complete investigation, repair, verification, and Gate 2 workflow.
+
 Verified runs also include deterministic database-behavior evidence:
 
 - baseline and candidate SQL, actor outcomes, schedule status, and invariant result side by side;

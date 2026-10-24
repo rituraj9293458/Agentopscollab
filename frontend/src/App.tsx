@@ -1,13 +1,15 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import {
   Activity, AlertTriangle, ArrowRight, Check, ChevronRight, CircleDot,
   Clock, Code2, Database, ExternalLink, GitCompare, Loader2, LockKeyhole, Pause,
   Play, ShieldCheck, SkipBack, SkipForward, TerminalSquare, X, Gauge,
 } from 'lucide-react'
-import type { InvariantResult, ModelStatus, RunEvent, RunReport, ScheduleResult, Target, UsageSnapshot } from './types'
+import type { CustomTargetProposal, InvariantResult, ModelStatus, RunEvent, RunReport, ScheduleResult, Target, UsageSnapshot } from './types'
 
 const API = import.meta.env.VITE_API_URL ?? ''
 const stages = ['load_target', 'inspect', 'investigate', 'execute_experiment', 'observe', 'repair', 'apply_patch', 'verify', 'human_review', 'finalize']
+const TERMINAL_STATUSES = ['READY', 'VERIFIED_CANDIDATE', 'MODEL_UNAVAILABLE', 'AWAITING_HUMAN_REVIEW', 'APPROVED', 'HUMAN_REJECTED', 'UNRESOLVED', 'UNCONFIRMED', 'EXECUTION_ERROR', 'UNVERIFIABLE_SCHEDULE', 'BUDGET_EXCEEDED', 'AUTHENTICATION_ERROR', 'RATE_LIMITED', 'QUOTA_EXCEEDED']
+const terminalStatus = (status: string) => TERMINAL_STATUSES.includes(status)
 
 function StatusPill({ status }: { status: string }) {
   const tone = status.includes('VERIFIED') || status === 'APPROVED' ? 'good' : status.includes('ERROR') || status === 'UNRESOLVED' || status === 'HUMAN_REJECTED' ? 'bad' : 'warn'
@@ -118,6 +120,16 @@ function App() {
   const [streamVersion, setStreamVersion] = useState(0)
   const [reviewComment, setReviewComment] = useState('')
   const [reviewSubmitting, setReviewSubmitting] = useState(false)
+  const [uploadFiles, setUploadFiles] = useState<File[]>([])
+  const [uploading, setUploading] = useState(false)
+  const [customProposal, setCustomProposal] = useState<CustomTargetProposal | null>(null)
+  const [contractAssertion, setContractAssertion] = useState('')
+  const folderInput = useRef<HTMLInputElement>(null)
+
+  useEffect(() => {
+    folderInput.current?.setAttribute('webkitdirectory', '')
+    folderInput.current?.setAttribute('directory', '')
+  }, [])
 
   function resetInterruptedRun(message: string) {
     localStorage.removeItem('raceproof.runId')
@@ -137,15 +149,30 @@ function App() {
   }, [])
 
   async function startRun() {
-    setError(null); setEvents([]); setReport(null); setStatus('QUEUED')
-    const response = await fetch(`${API}/api/runs`, {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ target_id: targetId }),
-    })
-    if (!response.ok) throw new Error(await response.text())
-    const data = await response.json()
-    localStorage.setItem('raceproof.runId', data.run_id)
-    setRunId(data.run_id)
+    const previousStatus = status
+    setError(null); setStatus('QUEUED')
+    const controller = new AbortController()
+    const timeout = window.setTimeout(() => controller.abort(), 10000)
+    try {
+      const response = await fetch(`${API}/api/runs`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ target_id: targetId }),
+        signal: controller.signal,
+      })
+      const body = await response.json().catch(() => null)
+      if (!response.ok) throw new Error(body?.detail ?? `Could not start investigation (${response.status})`)
+      setEvents([]); setReport(null)
+      localStorage.setItem('raceproof.runId', body.run_id)
+      setRunId(body.run_id)
+    } catch (error) {
+      setStatus(terminalStatus(previousStatus) ? previousStatus : 'READY')
+      if (error instanceof DOMException && error.name === 'AbortError') {
+        throw new Error('The backend did not accept the run within 10 seconds. The button was reset; check the backend terminal and try again.')
+      }
+      throw error
+    } finally {
+      window.clearTimeout(timeout)
+    }
   }
 
   async function submitReview(action: 'approve' | 'reject' | 'request_revision') {
@@ -166,6 +193,46 @@ function App() {
       throw error
     } finally {
       setReviewSubmitting(false)
+    }
+  }
+
+  async function analyzeFolder() {
+    if (!uploadFiles.length) return
+    setUploading(true); setError(null)
+    try {
+      const form = new FormData()
+      uploadFiles.forEach(file => {
+        const relative = (file as File & { webkitRelativePath?: string }).webkitRelativePath
+        const path = relative ? relative.split('/').slice(1).join('/') : file.name
+        form.append('files', file, path || file.name)
+      })
+      const response = await fetch(`${API}/api/targets/custom`, { method: 'POST', body: form })
+      const body = await response.json().catch(() => null)
+      if (!response.ok) throw new Error(body?.detail ?? `Upload failed (${response.status})`)
+      setCustomProposal(body)
+      setContractAssertion(body.proposed_invariant.assertion)
+    } finally {
+      setUploading(false)
+    }
+  }
+
+  async function approveContract() {
+    if (!customProposal) return
+    setUploading(true); setError(null)
+    try {
+      const response = await fetch(`${API}/api/targets/custom/${customProposal.target_id}/approve`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          invariant: { ...customProposal.proposed_invariant, assertion: contractAssertion },
+          actors: customProposal.actors,
+          editable_paths: customProposal.editable_paths,
+        }),
+      })
+      const body = await response.json().catch(() => null)
+      if (!response.ok) throw new Error(body?.detail ?? `Approval failed (${response.status})`)
+      setCustomProposal(body)
+    } finally {
+      setUploading(false)
     }
   }
 
@@ -231,6 +298,29 @@ function App() {
     return () => source.close()
   }, [runId, streamVersion])
 
+  useEffect(() => {
+    if (terminalStatus(status)) return
+    const timer = window.setTimeout(async () => {
+      if (!runId) {
+        setStatus('READY')
+        return
+      }
+      try {
+        const response = await fetch(`${API}/api/runs/${runId}`)
+        if (!response.ok) return
+        const data = await response.json()
+        if (terminalStatus(data.status)) {
+          setStatus(data.status)
+          setReport(data.report ?? null)
+          setError(data.error ?? null)
+        }
+      } catch {
+        // The regular health and event-stream handlers surface connectivity failures.
+      }
+    }, 2500)
+    return () => window.clearTimeout(timer)
+  }, [status, runId])
+
   const currentStage = useMemo(() => {
     const stageEvents = events.filter(event => event.kind === 'stage')
     return stageEvents.at(-1)?.stage ?? ''
@@ -255,14 +345,13 @@ function App() {
   const target = targets.find(item => item.id === targetId)
   const actors = target?.actors ?? []
   const evidence = Object.entries(invariant?.evidence ?? {}).slice(0, 3)
-  const terminal = ['READY', 'VERIFIED_CANDIDATE', 'MODEL_UNAVAILABLE', 'AWAITING_HUMAN_REVIEW', 'APPROVED', 'HUMAN_REJECTED', 'UNRESOLVED', 'UNCONFIRMED', 'EXECUTION_ERROR', 'UNVERIFIABLE_SCHEDULE', 'BUDGET_EXCEEDED', 'AUTHENTICATION_ERROR', 'RATE_LIMITED', 'QUOTA_EXCEEDED']
-  const busy = !terminal.includes(status)
+  const busy = !terminalStatus(status)
 
   return <main>
     <header className="topbar">
       <div className="brand"><div className="brand-mark"><LockKeyhole size={18} /></div><div><strong>RaceProof</strong><span>Concurrency lab</span></div></div>
       <div className="connection"><span className={`pulse ${health ? 'online' : ''}`} /> PostgreSQL {health === null ? 'checking' : health ? 'connected' : 'offline'}</div>
-      <div className="header-actions"><select value={targetId} onChange={event => setTargetId(event.target.value)} disabled={busy}>{targets.map(item => <option value={item.id} key={item.id}>{item.name}</option>)}</select><StatusPill status={status} /><button className="run-button" onClick={() => startRun().catch(e => setError(e.message))} disabled={busy || status === 'AWAITING_HUMAN_REVIEW' || health === false || !targetId}>{busy ? <Loader2 size={16} className="spin" /> : <Play size={15} fill="currentColor" />}Run investigation</button></div>
+      <div className="header-actions"><label className="folder-button"><input ref={folderInput} type="file" multiple accept=".py,.sql" onChange={event => setUploadFiles(Array.from(event.target.files ?? []))}/>Choose code folder</label><select value={targetId} onChange={event => setTargetId(event.target.value)} disabled={busy}>{targets.map(item => <option value={item.id} key={item.id}>{item.name}</option>)}</select><StatusPill status={status} /><button className="run-button" onClick={() => startRun().catch(e => setError(e.message))} disabled={busy || status === 'AWAITING_HUMAN_REVIEW' || health === false || !targetId}>{busy ? <Loader2 size={16} className="spin" /> : <Play size={15} fill="currentColor" />}Run investigation</button></div>
     </header>
 
     <section className="hero">
@@ -271,6 +360,18 @@ function App() {
     </section>
 
     {error && <div className="error-banner"><AlertTriangle size={17}/><span>{error}</span></div>}
+
+    {(uploadFiles.length > 0 || customProposal) && <section className="panel upload-panel">
+      <div className="panel-head"><div><span className="kicker">CUSTOM CODE · GATE 1</span><h2>Analyze and approve target contract</h2></div><Code2 size={20}/></div>
+      {!customProposal ? <><p>{uploadFiles.length} Python/SQL files selected. Files are parsed statically and are not imported or executed.</p><button className="run-button" disabled={uploading} onClick={() => analyzeFolder().catch(error => setError(error.message))}>{uploading ? <Loader2 size={15} className="spin"/> : <Activity size={15}/>}Analyze &amp; generate contract</button></> : <>
+        <div className="contract-grid"><div><span>Operation</span><strong>{customProposal.selected_operation?.entrypoint ?? 'No operation detected'}</strong></div><div><span>Risk</span><strong>{customProposal.selected_operation?.risk.replaceAll('_', ' ') ?? 'Manual review required'}</strong></div><div><span>Actors</span><strong>{customProposal.actors.map(actor => actor.id).join(' + ')}</strong></div><div><span>Editable paths</span><strong>{customProposal.editable_paths.join(', ') || 'None'}</strong></div></div>
+        <label className="contract-field"><span>Human-approved executable invariant</span><textarea value={contractAssertion} onChange={event => setContractAssertion(event.target.value)}/></label>
+        <div className="contract-schedule"><strong>{customProposal.reproduction_schedule.name}</strong><p>{customProposal.reproduction_schedule.description}</p><small>{customProposal.reproduction_schedule.checkpoints.join(' → ')}</small></div>
+        {!!customProposal.warnings.length && <div className="error-banner"><AlertTriangle size={16}/><span>{customProposal.warnings.join('; ')}</span></div>}
+        <p className="execution-blocker">{customProposal.execution_blocker}</p>
+        {customProposal.status === 'PENDING_CONTRACT_APPROVAL' ? <div className="review-actions"><button className="approve" disabled={uploading || !contractAssertion} onClick={() => approveContract().catch(error => setError(error.message))}>Approve analysis contract</button><button onClick={() => setCustomProposal(null)}>Revise upload</button></div> : <div className="cycle-status safe">CONTRACT APPROVED · ANALYSIS ONLY</div>}
+      </>}
+    </section>}
 
     <section className="stage-rail">
       {stages.map((stage, index) => {

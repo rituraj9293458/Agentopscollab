@@ -36,12 +36,31 @@ export type ScheduleResult = {
   invariant: InvariantResult | null
   elapsed_ms: number
   error: string | null
+  lock_waits: Array<{
+    waiting_actor: string
+    blocking_actors: string[]
+    lock_type: string
+    lock_mode: string
+    relation: string | null
+    duration_ms: number
+    release_point: string | null
+    deadlock: boolean
+  }>
+  wait_for_edges: Array<{
+    waiting_actor: string
+    blocking_actor: string
+    lock_type: string
+    lock_mode: string
+  }>
+  deadlock_cycle: boolean
 }
 
 export type Verification = {
   passed: boolean
   replay_mode: string
   gates: Record<string, boolean>
+  schedule_results: ScheduleResult[]
+  lock_evidence_results: ScheduleResult[]
   performance?: {
     mean_latency_ms: number
     p95_latency_ms: number
@@ -80,7 +99,12 @@ export type RunReport = {
   final_diff: string | null
   attempts: Array<{
     number: number
-    proposal?: { strategy: string; diagnosis: string }
+    proposal?: {
+      strategy: string
+      diagnosis: string
+      assumptions: string[]
+      residual_risks: string[]
+    }
     verification?: Verification
     failure_reason?: string
   }>
@@ -90,6 +114,9 @@ export type RunReport = {
   fallback_model: string | null
   fallback_enabled: boolean
   usage: UsageSnapshot
+  human_review: { decision: string; comment: string; decided_at?: string } | null
+  trace_url: string | null
+  stage_timings_ms: Record<string, number>
 }
 
 export type UsageSnapshot = {
@@ -120,4 +147,5 @@ export type ModelStatus = {
   fallback_model: string
   fallback_enabled: boolean
   budgets: Record<string, number>
+  langsmith?: { configured: boolean; tracing: boolean; project: string }
 }

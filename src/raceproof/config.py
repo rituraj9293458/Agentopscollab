@@ -36,12 +36,29 @@ class Settings(BaseSettings):
         default=None,
         validation_alias=AliasChoices("GEMINI_API_KEY", "GOOGLE_API_KEY"),
     )
+    langsmith_api_key: SecretStr | None = Field(
+        default=None,
+        validation_alias=AliasChoices("LANGSMITH_API_KEY", "RACEPROOF_LANGSMITH_API_KEY"),
+    )
+    langsmith_tracing: bool = Field(
+        default=False,
+        validation_alias=AliasChoices(
+            "LANGSMITH_TRACING",
+            "LANGSMITH_TRACING_V2",
+            "RACEPROOF_LANGSMITH_TRACING",
+        ),
+    )
+    langsmith_project: str = Field(
+        default="raceproof-local",
+        validation_alias=AliasChoices("LANGSMITH_PROJECT", "RACEPROOF_LANGSMITH_PROJECT"),
+    )
     max_repair_attempts: int = Field(default=3, ge=1, le=5)
     max_investigation_attempts: int = Field(default=3, ge=1, le=5)
     schedule_timeout_seconds: float = Field(default=8.0, gt=0, le=60)
     benchmark_runs: int = Field(default=20, ge=3, le=200)
     performance_regression_limit: float = Field(default=2.5, ge=1.0, le=10.0)
     artifact_dir: Path = Path("artifacts")
+    checkpoint_database: Path = Path("artifacts/checkpoints.sqlite")
 
     @property
     def resolved_investigation_model(self) -> str:
@@ -54,6 +71,10 @@ class Settings(BaseSettings):
     @property
     def gemini_api_key_value(self) -> str | None:
         return self.gemini_api_key.get_secret_value() if self.gemini_api_key else None
+
+    @property
+    def langsmith_api_key_value(self) -> str | None:
+        return self.langsmith_api_key.get_secret_value() if self.langsmith_api_key else None
 
 
 @lru_cache

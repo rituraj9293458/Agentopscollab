@@ -26,6 +26,9 @@ class FinalStatus(StrEnum):
     AUTHENTICATION_ERROR = "AUTHENTICATION_ERROR"
     RATE_LIMITED = "RATE_LIMITED"
     QUOTA_EXCEEDED = "QUOTA_EXCEEDED"
+    AWAITING_HUMAN_REVIEW = "AWAITING_HUMAN_REVIEW"
+    APPROVED = "APPROVED"
+    HUMAN_REJECTED = "HUMAN_REJECTED"
 
 
 class EventKind(StrEnum):
@@ -64,6 +67,24 @@ class InvariantResult(BaseModel):
     assertion: str
     evidence: dict[str, Any]
     explanation: str
+
+
+class LockWaitEvidence(BaseModel):
+    waiting_actor: str
+    blocking_actors: list[str] = Field(default_factory=list)
+    lock_type: str
+    lock_mode: str
+    relation: str | None = None
+    duration_ms: float
+    release_point: str | None = None
+    deadlock: bool = False
+
+
+class WaitForEdge(BaseModel):
+    waiting_actor: str
+    blocking_actor: str
+    lock_type: str
+    lock_mode: str
 
 
 class ScheduleAction(BaseModel):
@@ -176,6 +197,9 @@ class ScheduleResult(BaseModel):
     invariant: InvariantResult | None = None
     elapsed_ms: float
     error: str | None = None
+    lock_waits: list[LockWaitEvidence] = Field(default_factory=list)
+    wait_for_edges: list[WaitForEdge] = Field(default_factory=list)
+    deadlock_cycle: bool = False
 
 
 class StaticFinding(BaseModel):
@@ -295,6 +319,7 @@ class VerificationReport(BaseModel):
     replay_mode: str
     gates: dict[str, bool]
     schedule_results: list[ScheduleResult]
+    lock_evidence_results: list[ScheduleResult] = Field(default_factory=list)
     regression_output: str
     performance: PerformanceResult | None
     limitations: list[str]
@@ -327,6 +352,9 @@ class RunReport(BaseModel):
     events: list[RunEvent] = Field(default_factory=list)
     limitations: list[str] = Field(default_factory=list)
     human_approval_required: bool = True
+    human_review: dict[str, Any] | None = None
+    trace_url: str | None = None
+    stage_timings_ms: dict[str, float] = Field(default_factory=dict)
     investigation_model: str = ""
     repair_model: str = ""
     fallback_model: str | None = None

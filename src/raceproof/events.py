@@ -8,8 +8,12 @@ from raceproof.contracts import EventKind, RunEvent
 
 
 class EventRecorder:
-    def __init__(self, listener: Callable[[RunEvent], None] | None = None) -> None:
-        self._events: list[RunEvent] = []
+    def __init__(
+        self,
+        listener: Callable[[RunEvent], None] | None = None,
+        initial_events: list[RunEvent] | None = None,
+    ) -> None:
+        self._events: list[RunEvent] = list(initial_events or [])
         self._lock = threading.Lock()
         self._listener = listener
 

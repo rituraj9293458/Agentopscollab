@@ -20,6 +20,7 @@ from raceproof.usage import (
     UsageLimits,
     UsageTracker,
 )
+from raceproof.tracing import traced
 
 
 class InvestigationModel(Protocol):
@@ -177,6 +178,7 @@ evidence cannot justify another experiment."""
 
         return [read_investigation_snapshot]
 
+    @traced(name="raceproof.investigation_agent")
     def investigate(self, context: InvestigationContext) -> InvestigationDecision:
         available, reason = self.available()
         if not available:
@@ -300,10 +302,16 @@ and list the evidence needed. Otherwise set cannot_repair for an indefensible bo
                     }
                     for item in bundle.previous_attempts
                 ],
+                "human_feedback": [
+                    item["human_feedback"]
+                    for item in bundle.previous_attempts
+                    if item.get("human_feedback")
+                ],
             }
 
         return [read_repair_snapshot]
 
+    @traced(name="raceproof.repair_agent")
     def propose(self, bundle: FailureBundle) -> PatchProposal:
         available, reason = self.available()
         if not available:

@@ -15,7 +15,7 @@ RaceProof is an engine plus a validated application contract. Domain behavior st
 | Regression and performance gates | Declared command and measured execution | Yes |
 | Candidate promotion | Aggregate gates plus human review | Yes |
 
-The engine reports `SUSPECTED`, `REPRODUCED`, `VERIFIED_CANDIDATE`, `UNRESOLVED`, `MODEL_UNAVAILABLE`, `UNVERIFIABLE_SCHEDULE`, or `EXECUTION_ERROR`.
+The engine reports `SUSPECTED`, `REPRODUCED`, `AWAITING_HUMAN_REVIEW`, `APPROVED`, `HUMAN_REJECTED`, `UNRESOLVED`, `MODEL_UNAVAILABLE`, `UNVERIFIABLE_SCHEDULE`, or `EXECUTION_ERROR`.
 
 ## Package structure
 
@@ -146,7 +146,7 @@ START -> load -> inspect -> Investigation Agent -> execute -> observe
                                          +---- failed gates ---+
 ```
 
-Conditional edges enforce a confirmed failure before handoff, patch acceptance before verification, success before promotion, and separate investigation and repair attempt caps. Every node appends JSONL state evidence. Failure after a cap ends as `UNCONFIRMED`, `UNRESOLVED`, or `UNVERIFIABLE_SCHEDULE` with exact evidence.
+Conditional edges enforce a confirmed failure before handoff, patch acceptance before verification, human approval before final acceptance, and separate investigation and repair attempt caps. A SQLite LangGraph checkpointer stores the graph thread and pauses at a human-review interrupt after every deterministic gate passes. The reviewer can approve, reject, or route bounded feedback back to the Repair Agent. Every node appends JSONL state evidence. Failure after a cap ends as `UNCONFIRMED`, `UNRESOLVED`, or `UNVERIFIABLE_SCHEDULE` with exact evidence.
 
 ## Why exactly two agents
 
@@ -155,6 +155,16 @@ The previous prototype had only one Repair Agent after deterministic suspicion a
 ## API and UI
 
 FastAPI exposes registered target metadata and accepts `target_id` rather than an inventory scenario. Background runs stream ordered Server-Sent Events. The React dashboard derives its title, operation, actors, invariant, evidence fields, and transaction lanes from target metadata and the report.
+
+## Optional LangSmith tracing
+
+LangSmith tracing is disabled unless a key and explicit tracing flag are configured. One parent
+trace covers the complete RaceProof run, with nested traces for all nine workflow stages, both
+agent roles, static inspection, controlled PostgreSQL scheduling, guarded patch application, and
+candidate verification. LangChain model calls appear below their owning agent trace. Trace input
+and output processors redact configured API keys and PostgreSQL URL passwords. Approved source,
+candidate diffs, SQL evidence, and model results remain visible by design, so tracing should only
+target a trusted LangSmith workspace.
 
 ## Security and production gaps
 

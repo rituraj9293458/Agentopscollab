@@ -6,7 +6,7 @@ import re
 
 def redact_sensitive(value: object) -> str:
     text = str(value)
-    for name in ("GEMINI_API_KEY", "GOOGLE_API_KEY"):
+    for name in ("GEMINI_API_KEY", "GOOGLE_API_KEY", "LANGSMITH_API_KEY"):
         secret = os.environ.get(name)
         if secret and secret != "placeholder":
             text = text.replace(secret, "[REDACTED]")

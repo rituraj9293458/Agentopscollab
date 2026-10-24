@@ -55,15 +55,24 @@ load -> inspect -> Investigation Agent -> execute experiment -> observe
                                                         |
                                                confirmed handoff
                                                         v
- final report <- verify <- guarded apply <- Repair Agent
+ human review <- verify <- guarded apply <- Repair Agent
+      |                                  ^
+      +-- request revision --------------+
+      |
+ final report
                     |                            ^
                     +------ failed gates --------+
                          bounded attempts
 ```
 
-The agents use distinct LangChain prompts, structured outputs, and tools. Each agent gets one role-specific snapshot tool containing only its approved bounded context. This avoids a separate provider request for every source, schema, schedule, and feedback read. LangGraph validates the selected experiment, owns both bounded loops, and passes a compact typed artifact between them instead of an open-ended conversation.
+The agents use distinct LangChain prompts, structured outputs, and permissions. The engine builds one role-specific snapshot containing only each agent's approved bounded context and embeds it once in that agent's request. This avoids tool-call loops and a separate provider request for every source, schema, schedule, and feedback read. LangGraph validates the selected experiment, owns both bounded loops, and passes a compact typed artifact between them instead of an open-ended conversation.
 
 Each repair attempt starts from the unchanged target repository. A diff can touch only declared editable paths. It is checked with `git apply --check`, parsed, compiled, and executed in a disposable copy. If the original checkpoint no longer exists, the exact schedule is marked invalid or timed out and the verifier tries only a developer-declared adapted schedule. A missing checkpoint never becomes a pass.
+
+After every deterministic gate passes, the SQLite-checkpointed graph pauses as
+`AWAITING_HUMAN_REVIEW`. The dashboard shows the complete diff, gate evidence, performance,
+residual risks, usage, trace link, and stage timings. A reviewer can approve, reject, or request a
+bounded revision. Only approval produces `APPROVED`; verification alone is not final acceptance.
 
 ## Requirements and setup
 
@@ -88,6 +97,21 @@ GEMINI_API_KEY=placeholder
 ```
 
 Keep `.env` local. It is ignored by Git. Restart the backend after changing it, then run `raceproof model-status` for a no-network detection check and `raceproof validate-models` for the opt-in live capability check. Never paste a real key into source, frontend variables, logs, reports, or chat.
+
+Optional LangSmith tracing is disabled by default. To trace a complete run, its nine workflow
+stages, both agents, controlled schedules, guarded patch application, verification, and underlying
+LangChain model calls, set:
+
+```dotenv
+LANGSMITH_API_KEY=your-langsmith-key
+LANGSMITH_TRACING=true
+LANGSMITH_PROJECT=raceproof-local
+```
+
+Restart the backend after changing these values. Trace serialization redacts configured API keys
+and PostgreSQL URL passwords. Traces intentionally include approved source, candidate diffs, SQL
+evidence, and structured model results, so enable tracing only for a LangSmith workspace where that
+code and evidence may be stored.
 
 If Docker is unavailable on Windows and PostgreSQL 17 is installed:
 
@@ -135,7 +159,7 @@ raceproof run --config examples/inventory_app/raceproof.json
 
 The default Investigation Agent uses `gemini-3.5-flash-lite`. The Repair Agent uses `gemini-3.1-flash-lite`. Optional fallback uses `gemini-3.8-flash` and is disabled by default. Set `RACEPROOF_ENABLE_MODEL_FALLBACK=true` only after validating it. Fallback occurs only for unavailable-model or structured-output failures. It does not bypass authentication, quota, rate, or local budget failures.
 
-Local budgets default to 12 total provider requests, 5 Investigation Agent requests, 7 Repair Agent requests, and 60,000 provider-reported tokens. A normal successful path uses one snapshot tool round trip per agent and does not make a second Investigation Agent call after PostgreSQL has already established the result. Provider retries default to one. Request limits are enforced before a provider call. Token limits are enforced from provider metadata and stop the next call after an overrun. If metadata is missing, the report marks token totals as lower bounds. Dollar estimates are omitted unless a verified pricing table is explicitly configured.
+Local budgets default to 12 total provider requests, 5 Investigation Agent requests, 7 Repair Agent requests, and 60,000 provider-reported tokens. A normal successful path uses one model request per agent and does not make a second Investigation Agent call after PostgreSQL has already established the result. Provider retries default to one. Request limits are enforced before a provider call. Token limits are enforced from provider metadata and stop the next call after an overrun. If metadata is missing, the report marks token totals as lower bounds. Dollar estimates are omitted unless a verified pricing table is explicitly configured.
 
 ## API and dashboard
 
@@ -153,6 +177,15 @@ discard its in-memory run registry. For a backend with reload disabled, use
 
 The dashboard fetches generic target metadata and sends only a selected `target_id` when starting a run.
 
+Verified runs also include deterministic database-behavior evidence:
+
+- baseline and candidate SQL, actor outcomes, schedule status, and invariant result side by side;
+- sampled PostgreSQL lock waits with owner, waiter, lock type, mode, duration, relation, and release point;
+- a wait-for graph with explicit cycle detection and deadlock status.
+
+Lock evidence from an exact schedule that becomes invalid after a transaction-shape change is retained
+only as diagnostic evidence. It never counts as a successful replay or verification gate.
+
 - `GET /api/targets`: list validated registered targets.
 - `GET /api/health`: report service and PostgreSQL status.
 - `GET /api/model-status`: report model IDs, local budgets, fallback state, and only whether a key is configured.
@@ -160,6 +193,7 @@ The dashboard fetches generic target metadata and sends only a selected `target_
 - `GET /api/runs/{run_id}`: status, events, and report.
 - `GET /api/runs/{run_id}/events`: Server-Sent Events stream.
 - `GET /api/runs/{run_id}/report`: completed structured evidence.
+- `POST /api/runs/{run_id}/review`: approve, reject, or request revision for a verified candidate.
 
 ## Verification and tests
 
@@ -190,7 +224,7 @@ Runs write to the engine artifact root:
 - The live `validate-models` command is opt-in, consumes provider quota, and was not run unless a real key was configured.
 - Verification covers configured finite schedules and outcomes, not all possible interleavings.
 - Candidate code runs in a child process and disposable workspace, but not an OS sandbox. Use a restricted container or VM for untrusted generated code.
-- The API run store and LangGraph checkpointer are in memory, so an active run is not restartable. Completed reports are durable and the API reloads them by run ID after a backend restart.
+- The API run registry is in memory. Paused human-review runs are recoverable after a restart from their persisted report and SQLite LangGraph checkpoint. Completed reports are durable and reloadable by run ID.
 - Patch filtering is defense in depth and cannot prove arbitrary generated code is benign.
 - Performance results are local observations, not production capacity claims.
 

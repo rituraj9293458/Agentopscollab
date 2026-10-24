@@ -44,46 +44,53 @@ def verify(
     target = load_target_config(root / config_relative_path, allowed_roots=[root])
     adapter = load_adapter(target)
     config = target.config
-    engine = create_database_engine(database_url)
     selected_results = []
+    lock_evidence_results = []
     attempted_modes: list[str] = []
-    try:
-        for _ in range(config.verification.replay_count):
-            selected = None
-            for index, schedule in enumerate(config.verification_schedules):
-                recorder = EventRecorder()
-                result = ControlledScheduler(engine, recorder).execute(
+    for _ in range(config.verification.replay_count):
+        selected = None
+        for index, schedule in enumerate(config.verification_schedules):
+            recorder = EventRecorder()
+            replay_engine = create_database_engine(database_url, recorder)
+            try:
+                result = ControlledScheduler(replay_engine, recorder).execute(
                     adapter,
                     config.actors,
                     schedule,
                     exact=index == 0,
                 )
-                attempted_modes.append(f"{schedule.name}:{result.status.value}")
-                if result.status == ScheduleStatus.COMPLETED:
-                    selected = result
-                    break
-            if selected is not None:
-                selected_results.append(selected)
+            finally:
+                replay_engine.dispose()
+            attempted_modes.append(f"{schedule.name}:{result.status.value}")
+            if result.lock_waits or result.wait_for_edges or result.deadlock_cycle:
+                lock_evidence_results.append(result)
+            if result.status == ScheduleStatus.COMPLETED:
+                selected = result
+                break
+        if selected is not None:
+            selected_results.append(selected)
 
-        schedule_valid = len(selected_results) == config.verification.replay_count
-        invariants_pass = schedule_valid and all(
-            result.invariant is not None and result.invariant.passed for result in selected_results
-        )
-        outcomes_valid = schedule_valid and all(
-            outcomes_match(result.actor_outcomes, config.verification.allowed_outcomes)
-            for result in selected_results
-        )
-        completed = schedule_valid and all(result.completed for result in selected_results)
-        regression = _run_regression(root, target)
+    schedule_valid = len(selected_results) == config.verification.replay_count
+    invariants_pass = schedule_valid and all(
+        result.invariant is not None and result.invariant.passed for result in selected_results
+    )
+    outcomes_valid = schedule_valid and all(
+        outcomes_match(result.actor_outcomes, config.verification.allowed_outcomes)
+        for result in selected_results
+    )
+    completed = schedule_valid and all(result.completed for result in selected_results)
+    regression = _run_regression(root, target)
+    benchmark_engine = create_database_engine(database_url)
+    try:
         performance = benchmark_schedule(
-            engine,
+            benchmark_engine,
             adapter,
             config.actors,
             config.verification_schedules[-1],
             config.verification.benchmark_runs,
         )
     finally:
-        engine.dispose()
+        benchmark_engine.dispose()
 
     performance_acceptable = (
         baseline_p95_ms is None
@@ -107,6 +114,7 @@ def verify(
         replay_mode="+".join(replay_modes) if replay_modes else "unverifiable",
         gates=gates,
         schedule_results=selected_results,
+        lock_evidence_results=lock_evidence_results,
         regression_output=(regression.stdout + regression.stderr)[-8000:],
         performance=performance,
         limitations=[

@@ -7,8 +7,10 @@ import sys
 from pathlib import Path
 
 from raceproof.contracts import VerificationReport
+from raceproof.tracing import traced
 
 
+@traced(name="raceproof.verify_candidate", run_type="tool")
 def verify_candidate(
     candidate: Path,
     config_relative_path: str,

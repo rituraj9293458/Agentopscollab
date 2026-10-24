@@ -186,6 +186,7 @@ def settings_for(tmp_path: Path, database_url: str) -> Settings:
     return Settings(
         database_url=database_url,
         artifact_dir=tmp_path / "artifacts",
+        checkpoint_database=tmp_path / "checkpoints.sqlite",
         max_investigation_attempts=2,
         max_repair_attempts=2,
         benchmark_runs=3,
@@ -258,14 +259,15 @@ def test_generated_candidate_receives_handoff_and_is_verified(tmp_path, database
     target = TargetRegistry(root / "examples").get("inventory_oversell")
     before = (target.repository_root / "src/inventory_app/operations.py").read_text()
     repair = GeneratedInventoryRepair()
-    report = RaceProofRunner(
+    runner = RaceProofRunner(
         root,
         target,
         settings_for(tmp_path, database_url),
         InvestigationTestDouble(),
         repair,
-    ).run()
-    assert report.status == FinalStatus.VERIFIED_CANDIDATE
+    )
+    report = runner.run()
+    assert report.status == FinalStatus.AWAITING_HUMAN_REVIEW
     assert report.final_diff and "Product.stock > 0" in report.final_diff
     assert report.attempts[0].verification is not None
     assert report.attempts[0].verification.passed
@@ -273,6 +275,9 @@ def test_generated_candidate_receives_handoff_and_is_verified(tmp_path, database
     assert any(event.actor == "Investigation Agent" for event in report.events)
     assert any(event.actor == "Repair Agent" for event in report.events)
     assert (target.repository_root / "src/inventory_app/operations.py").read_text() == before
+    approved = runner.resume_human_review(report.run_id, "approve", "Reviewed")
+    assert approved.status == FinalStatus.APPROVED
+    assert approved.human_review and approved.human_review["decision"] == "approve"
 
 
 def test_failed_verification_is_returned_to_repair_agent_for_revision(
@@ -288,7 +293,7 @@ def test_failed_verification_is_returned_to_repair_agent_for_revision(
         InvestigationTestDouble(),
         repair,
     ).run()
-    assert report.status == FinalStatus.VERIFIED_CANDIDATE
+    assert report.status == FinalStatus.AWAITING_HUMAN_REVIEW
     assert len(report.attempts) == 2
     assert report.attempts[0].verification is not None
     assert not report.attempts[0].verification.passed
@@ -311,7 +316,7 @@ def test_repair_agent_can_request_one_bounded_additional_investigation(
         investigator,
         repair,
     ).run()
-    assert report.status == FinalStatus.VERIFIED_CANDIDATE
+    assert report.status == FinalStatus.AWAITING_HUMAN_REVIEW
     assert len(report.investigation_attempts) == 2
     assert investigator.contexts[1].repair_evidence_requests == [
         "Repeat the stale-read interleaving."

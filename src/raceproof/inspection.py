@@ -4,6 +4,7 @@ import ast
 from pathlib import Path
 
 from raceproof.contracts import StaticFinding
+from raceproof.tracing import traced
 
 
 class ConcurrencyInspector(ast.NodeVisitor):
@@ -71,6 +72,7 @@ def _call_name(node: ast.expr) -> str | None:
     return None
 
 
+@traced(name="raceproof.inspect_python_file", run_type="tool")
 def inspect_python_file(path: Path, repository_root: Path) -> list[StaticFinding]:
     source = path.read_text(encoding="utf-8")
     tree = ast.parse(source)

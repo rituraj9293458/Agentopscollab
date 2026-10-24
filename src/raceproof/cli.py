@@ -13,6 +13,7 @@ from raceproof.model_validation import validate_model_capability
 from raceproof.runtime import build_usage_tracker, model_status
 from raceproof.scheduler import ControlledScheduler
 from raceproof.target import TargetRegistry, load_adapter, load_target_config
+from raceproof.tracing import configure_langsmith
 from raceproof.workflow import RaceProofRunner
 
 
@@ -33,6 +34,7 @@ def main() -> int:
     run.add_argument("--config", type=Path, required=True)
     args = parser.parse_args()
     settings = get_settings()
+    configure_langsmith(settings)
     root = Path.cwd().resolve()
     if args.command == "targets":
         for target in TargetRegistry(root / "examples").list():
@@ -113,7 +115,10 @@ def main() -> int:
     ).run()
     print(report.model_dump_json(indent=2))
     return (
-        0 if report.status.value in {"REPRODUCED", "VERIFIED_CANDIDATE", "MODEL_UNAVAILABLE"} else 2
+        0
+        if report.status.value
+        in {"REPRODUCED", "AWAITING_HUMAN_REVIEW", "APPROVED", "MODEL_UNAVAILABLE"}
+        else 2
     )
 
 

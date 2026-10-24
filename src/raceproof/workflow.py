@@ -3,14 +3,17 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import sqlite3
 import threading
 import uuid
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal, TypedDict
 
-from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.graph import END, START, StateGraph
+from langgraph.types import Command, interrupt
+from langsmith.run_helpers import get_current_run_tree
 
 from raceproof.config import Settings
 from raceproof.contracts import (
@@ -32,6 +35,7 @@ from raceproof.patching import PatchGuard, WorkspaceManager, canonical_diff
 from raceproof.scheduler import ControlledScheduler, benchmark_schedule
 from raceproof.security import redact_sensitive
 from raceproof.target import LoadedTarget, load_adapter
+from raceproof.tracing import traced
 from raceproof.usage import (
     BudgetExceededError,
     ModelAuthenticationError,
@@ -62,6 +66,9 @@ class WorkflowState(TypedDict, total=False):
     proposal: dict[str, Any]
     final_diff: str
     terminal_reason: str
+    human_feedback: str
+    human_review: dict[str, Any]
+    trace_url: str
 
 
 class RaceProofRunner:
@@ -76,6 +83,7 @@ class RaceProofRunner:
         repair_model: RepairModel,
         listener: Any | None = None,
         usage_tracker: UsageTracker | None = None,
+        initial_events: list[Any] | None = None,
     ) -> None:
         self.engine_root = engine_root.resolve()
         self.target = target
@@ -84,8 +92,16 @@ class RaceProofRunner:
         self.investigation_model = investigation_model
         self.repair_model = repair_model
         self.usage_tracker = usage_tracker or UsageTracker(UsageLimits())
-        self.recorder = EventRecorder(listener)
+        self.recorder = EventRecorder(listener, initial_events=initial_events)
         artifact_root = (self.engine_root / settings.artifact_dir).resolve()
+        checkpoint_path = settings.checkpoint_database
+        if not checkpoint_path.is_absolute():
+            checkpoint_path = self.engine_root / checkpoint_path
+        checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+        self._checkpoint_connection = sqlite3.connect(
+            checkpoint_path, check_same_thread=False
+        )
+        self.checkpointer = SqliteSaver(self._checkpoint_connection)
         self.workspace = WorkspaceManager(target.repository_root, artifact_root)
         protected = tuple(
             sorted(
@@ -148,12 +164,14 @@ class RaceProofRunner:
             unique.setdefault(item.name, item)
         return list(unique.values())
 
+    @traced(name="raceproof.load_target")
     def _load_target(self, state: WorkflowState) -> WorkflowState:
         self._stage("load_target", {"target_id": self.target.config.id})
         update: WorkflowState = {"status": FinalStatus.SUSPECTED.value}
         self._persist(state["run_id"], "load_target", update)
         return update
 
+    @traced(name="raceproof.inspect")
     def _inspect(self, state: WorkflowState) -> WorkflowState:
         self._stage("inspect", {"target_id": self.target.config.id})
         findings = []
@@ -206,6 +224,7 @@ class RaceProofRunner:
             ],
         )
 
+    @traced(name="raceproof.investigate")
     def _investigate(self, state: WorkflowState) -> WorkflowState:
         number = len(state.get("investigation_attempts", [])) + 1
         self._stage("investigate", {"agent": "Investigation Agent", "attempt": number})
@@ -282,6 +301,7 @@ class RaceProofRunner:
             return "execute_experiment"
         return "investigate"
 
+    @traced(name="raceproof.execute_experiment")
     def _execute_experiment(self, state: WorkflowState) -> WorkflowState:
         schedule = next(
             item for item in self._experiments() if item.name == state["selected_experiment"]
@@ -306,6 +326,7 @@ class RaceProofRunner:
         self._persist(state["run_id"], "execute_experiment", update)
         return update
 
+    @traced(name="raceproof.observe")
     def _observe(self, state: WorkflowState) -> WorkflowState:
         self._stage("observe", {"agent": "Investigation Agent"})
         attempts = [dict(item) for item in state["investigation_attempts"]]
@@ -414,9 +435,17 @@ class RaceProofRunner:
             editable_paths=config.operation.editable_paths,
             protected_paths=config.operation.protected_paths,
             investigation_artifact=state["investigation_artifact"],
-            previous_attempts=state.get("attempts", []),
+            previous_attempts=[
+                *state.get("attempts", []),
+                *(
+                    [{"human_feedback": state["human_feedback"]}]
+                    if state.get("human_feedback")
+                    else []
+                ),
+            ],
         )
 
+    @traced(name="raceproof.repair")
     def _repair_agent(self, state: WorkflowState) -> WorkflowState:
         number = state.get("attempt_number", 0) + 1
         self._stage("repair", {"agent": "Repair Agent", "attempt": number})
@@ -522,6 +551,7 @@ class RaceProofRunner:
             return "repair_agent"
         return "finalize"
 
+    @traced(name="raceproof.apply_patch")
     def _apply_patch(self, state: WorkflowState) -> WorkflowState:
         self._stage("apply_patch", {"attempt": state["attempt_number"]})
         candidate = self.workspace.create_candidate(state["attempt_number"])
@@ -551,6 +581,7 @@ class RaceProofRunner:
             return "repair_agent"
         return "finalize"
 
+    @traced(name="raceproof.verify")
     def _verify(self, state: WorkflowState) -> WorkflowState:
         self._stage("verify", {"attempt": state["attempt_number"]})
         candidate = Path(state["candidate_path"])
@@ -604,13 +635,81 @@ class RaceProofRunner:
         self._persist(state["run_id"], "verify", update)
         return update
 
-    def _route_after_verify(self, state: WorkflowState) -> Literal["repair_agent", "finalize"]:
+    def _route_after_verify(
+        self, state: WorkflowState
+    ) -> Literal["repair_agent", "prepare_human_review", "finalize"]:
         if state.get("status") == FinalStatus.VERIFIED_CANDIDATE.value:
-            return "finalize"
+            return "prepare_human_review"
         if state.get("attempt_number", 0) < self.settings.max_repair_attempts:
             return "repair_agent"
         return "finalize"
 
+    @traced(name="raceproof.prepare_human_review")
+    def _prepare_human_review(self, state: WorkflowState) -> WorkflowState:
+        self._stage(
+            "human_review",
+            {"status": FinalStatus.AWAITING_HUMAN_REVIEW.value},
+        )
+        update: WorkflowState = {
+            "status": FinalStatus.AWAITING_HUMAN_REVIEW.value,
+            "human_review": {"decision": "pending", "comment": ""},
+        }
+        self._persist(state["run_id"], "prepare_human_review", update)
+        return update
+
+    @traced(name="raceproof.human_review")
+    def _human_review(self, state: WorkflowState) -> WorkflowState:
+        decision = interrupt(
+            {
+                "run_id": state["run_id"],
+                "candidate_diff": state.get("final_diff", ""),
+                "verification": state.get("attempts", [])[-1].get("verification", {}),
+                "action": "approve, reject, or request_revision",
+            }
+        )
+        action = str(decision.get("action", "")).lower()
+        comment = str(decision.get("comment", "")).strip()
+        review = {
+            "decision": action,
+            "comment": comment,
+            "decided_at": datetime.now(UTC).isoformat(),
+        }
+        if action == "approve":
+            status = FinalStatus.APPROVED.value
+            reason = ""
+        elif action == "reject":
+            status = FinalStatus.HUMAN_REJECTED.value
+            reason = comment or "Candidate rejected by human reviewer"
+        elif action == "request_revision":
+            status = FinalStatus.REPRODUCED.value
+            reason = ""
+        else:
+            raise ValueError(f"unknown human review action: {action}")
+        self.recorder.add(
+            EventKind.AGENT,
+            "human_review",
+            action,
+            actor="Human Reviewer",
+            detail=review,
+        )
+        update: WorkflowState = {
+            "status": status,
+            "terminal_reason": reason,
+            "human_review": review,
+            "human_feedback": comment if action == "request_revision" else "",
+        }
+        self._persist(state["run_id"], "human_review", update)
+        return update
+
+    def _route_after_human_review(
+        self, state: WorkflowState
+    ) -> Literal["repair_agent", "finalize"]:
+        if (state.get("human_review") or {}).get("decision") == "request_revision":
+            if state.get("attempt_number", 0) < self.settings.max_repair_attempts:
+                return "repair_agent"
+        return "finalize"
+
+    @traced(name="raceproof.finalize")
     def _finalize(self, state: WorkflowState) -> WorkflowState:
         self._stage("finalize", {"status": state.get("status")})
         self._persist(state["run_id"], "finalize", {"status": state.get("status", "")})
@@ -626,6 +725,8 @@ class RaceProofRunner:
         graph.add_node("repair_agent", self._repair_agent)
         graph.add_node("apply_patch", self._apply_patch)
         graph.add_node("verify", self._verify)
+        graph.add_node("prepare_human_review", self._prepare_human_review)
+        graph.add_node("human_review", self._human_review)
         graph.add_node("finalize", self._finalize)
         graph.add_edge(START, "load_target")
         graph.add_edge("load_target", "inspect")
@@ -636,26 +737,65 @@ class RaceProofRunner:
         graph.add_conditional_edges("repair_agent", self._route_after_repair_agent)
         graph.add_conditional_edges("apply_patch", self._route_after_apply)
         graph.add_conditional_edges("verify", self._route_after_verify)
+        graph.add_edge("prepare_human_review", "human_review")
+        graph.add_conditional_edges("human_review", self._route_after_human_review)
         graph.add_edge("finalize", END)
-        return graph.compile(checkpointer=InMemorySaver())
+        return graph.compile(checkpointer=self.checkpointer)
 
+    @traced(name="raceproof.run")
     def run(self, run_id: str | None = None) -> RunReport:
         run_id = run_id or uuid.uuid4().hex[:12]
+        current_trace = get_current_run_tree()
+        trace_url = ""
+        if current_trace is not None:
+            try:
+                trace_url = current_trace.get_url()
+            except Exception:  # noqa: BLE001 - tracing must never break a run
+                trace_url = ""
         initial: WorkflowState = {
             "run_id": run_id,
             "status": FinalStatus.SUSPECTED.value,
             "investigation_attempts": [],
             "attempts": [],
             "attempt_number": 0,
+            "trace_url": trace_url,
         }
         final = self.graph.invoke(
             initial,
             config={"configurable": {"thread_id": run_id}, "recursion_limit": 40},
         )
+        return self._build_report(run_id, final)
+
+    @traced(name="raceproof.resume_human_review")
+    def resume_human_review(self, run_id: str, action: str, comment: str = "") -> RunReport:
+        final = self.graph.invoke(
+            Command(resume={"action": action, "comment": comment}),
+            config={"configurable": {"thread_id": run_id}, "recursion_limit": 40},
+        )
+        return self._build_report(run_id, final)
+
+    def _stage_timings(self) -> dict[str, float]:
+        stages = [event for event in self.recorder.snapshot() if event.kind == EventKind.STAGE]
+        timings: dict[str, float] = {}
+        for index, event in enumerate(stages):
+            next_time = (
+                stages[index + 1].timestamp
+                if index + 1 < len(stages)
+                else datetime.now(UTC)
+            )
+            timings[event.stage] = round(
+                timings.get(event.stage, 0.0)
+                + (next_time - event.timestamp).total_seconds() * 1000,
+                2,
+            )
+        return timings
+
+    def _build_report(self, run_id: str, final: WorkflowState) -> RunReport:
         config = self.target.config
+        waiting = final.get("status") == FinalStatus.AWAITING_HUMAN_REVIEW.value
         report = RunReport(
             run_id=run_id,
-            finished_at=datetime.now(UTC),
+            finished_at=None if waiting else datetime.now(UTC),
             target_id=config.id,
             target_name=config.name,
             target_operation=config.operation.callable,
@@ -680,6 +820,9 @@ class RaceProofRunner:
             fallback_model=self.settings.fallback_model,
             fallback_enabled=self.settings.enable_model_fallback,
             usage=self.usage_tracker.snapshot(),
+            human_review=final.get("human_review"),
+            trace_url=final.get("trace_url") or None,
+            stage_timings_ms=self._stage_timings(),
         )
         output = self.engine_root / self.settings.artifact_dir / "runs" / run_id
         output.mkdir(parents=True, exist_ok=True)

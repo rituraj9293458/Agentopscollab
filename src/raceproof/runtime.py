@@ -25,6 +25,14 @@ def model_status(settings: Settings) -> dict[str, object]:
         "repair_model": settings.resolved_repair_model,
         "fallback_model": settings.fallback_model,
         "fallback_enabled": settings.enable_model_fallback,
+        "langsmith": {
+            "configured": bool(
+                settings.langsmith_api_key_value
+                and settings.langsmith_api_key_value != "placeholder"
+            ),
+            "tracing": settings.langsmith_tracing,
+            "project": settings.langsmith_project,
+        },
         "budgets": {
             "max_model_requests": settings.max_model_requests,
             "max_investigation_requests": settings.max_investigation_requests,

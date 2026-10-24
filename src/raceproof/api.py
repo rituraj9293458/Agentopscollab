@@ -23,6 +23,11 @@ class StartRunRequest(BaseModel):
     target_id: str
 
 
+class ReviewRunRequest(BaseModel):
+    action: str
+    comment: str = ""
+
+
 repository_root = Path(__file__).resolve().parents[2]
 service = RunService(repository_root)
 registry = TargetRegistry(repository_root / "examples")
@@ -160,3 +165,22 @@ def get_report(run_id: str):
     if active.report is None:
         raise HTTPException(status_code=409, detail="report is not ready")
     return active.report
+
+
+@app.post("/api/runs/{run_id}/review", status_code=202)
+def review_run(run_id: str, request: ReviewRunRequest) -> dict[str, str]:
+    if request.action not in {"approve", "reject", "request_revision"}:
+        raise HTTPException(status_code=422, detail="invalid review action")
+    try:
+        if service.get(run_id) is None:
+            report = _persisted_report(run_id)
+            if report is None:
+                raise KeyError("active reviewable run not found")
+            target = registry.get(report.target_id)
+            service.restore_reviewable(run_id, target, report)
+        active = service.review(run_id, request.action, request.comment)
+    except (KeyError, TargetConfigurationError) as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return {"run_id": run_id, "status": active.status}

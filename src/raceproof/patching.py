@@ -9,6 +9,7 @@ import subprocess
 from pathlib import Path
 
 from raceproof.contracts import PatchValidation
+from raceproof.tracing import traced
 
 DIFF_PATH = re.compile(r"^(?:\+\+\+|---)\s+(?:a/|b/)?([^\t\r\n]+)", re.MULTILINE)
 OLD_DIFF_PATH = re.compile(r"^---\s+(?:a/)?([^\t\r\n]+)", re.MULTILINE)
@@ -114,6 +115,7 @@ class PatchGuard:
                 errors.append(f"forbidden addition: {token}")
         return PatchValidation(accepted=not errors, errors=errors, changed_paths=paths)
 
+    @traced(name="raceproof.patch_guard", run_type="tool")
     def apply(self, candidate: Path, diff: str) -> PatchValidation:
         diff = normalize_unified_diff(diff)
         validation = self.validate(diff)

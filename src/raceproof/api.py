@@ -17,10 +17,11 @@ from raceproof.database import create_database_engine
 from raceproof.runtime import model_status
 from raceproof.security import redact_sensitive
 from raceproof.service import RunService
-from raceproof.target import TargetConfigurationError, TargetRegistry
+from raceproof.target import LoadedTarget, TargetConfigurationError, TargetRegistry, load_target_config
 from raceproof.upload import (
     UploadValidationError,
     UploadedSource,
+    analyze_approved_custom_target,
     approve_custom_contract,
     synthesize_custom_target,
 )
@@ -67,6 +68,25 @@ def _persisted_report(run_id: str) -> RunReport | None:
         return None
 
 
+def _resolve_target(target_id: str) -> LoadedTarget:
+    try:
+        return registry.get(target_id)
+    except TargetConfigurationError:
+        if re.fullmatch(r"custom_[0-9a-f]{12}", target_id) is None:
+            raise
+        proposal_path = custom_target_root / target_id / "proposal.json"
+        try:
+            proposal = json.loads(proposal_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise TargetConfigurationError("custom target proposal not found") from exc
+        if not proposal.get("execution_ready"):
+            raise TargetConfigurationError(
+                str(proposal.get("execution_blocker") or "custom target is not executable")
+            )
+        config_path = custom_target_root / target_id / str(proposal["executable_config"])
+        return load_target_config(config_path, allowed_roots=[custom_target_root])
+
+
 @app.get("/api/health")
 def health() -> dict[str, object]:
     database = False
@@ -90,7 +110,7 @@ def get_model_status() -> dict[str, object]:
 @app.post("/api/runs", status_code=202)
 def start_run(request: StartRunRequest) -> dict[str, str]:
     try:
-        target = registry.get(request.target_id)
+        target = _resolve_target(request.target_id)
     except TargetConfigurationError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     run_id = uuid.uuid4().hex[:12]
@@ -153,6 +173,14 @@ def approve_custom_target(
             request.actors,
             request.editable_paths,
         )
+    except UploadValidationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@app.post("/api/targets/custom/{target_id}/analyze")
+def analyze_custom_target(target_id: str) -> dict[str, object]:
+    try:
+        return analyze_approved_custom_target(custom_target_root, target_id)
     except UploadValidationError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
@@ -234,7 +262,7 @@ def review_run(run_id: str, request: ReviewRunRequest) -> dict[str, str]:
             report = _persisted_report(run_id)
             if report is None:
                 raise KeyError("active reviewable run not found")
-            target = registry.get(report.target_id)
+            target = _resolve_target(report.target_id)
             service.restore_reviewable(run_id, target, report)
         active = service.review(run_id, request.action, request.comment)
     except (KeyError, TargetConfigurationError) as exc:

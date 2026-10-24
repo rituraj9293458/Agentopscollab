@@ -162,6 +162,7 @@ export type CustomTargetProposal = {
     line: number
     signals: string[]
     risk: string
+    suggested_invariant: { name: string; description: string; assertion: string }
   } | null
   operation_candidates: Array<Record<string, unknown>>
   actors: Array<{ id: string; input: Record<string, unknown> }>
@@ -177,4 +178,42 @@ export type CustomTargetProposal = {
   warnings: string[]
   files: string[]
   execution_blocker: string
+  executable_config?: string
+}
+
+export type CustomAnalysis = {
+  target_id: string
+  status: 'STATIC_ANALYSIS_COMPLETE' | 'CUSTOM_ANALYSIS_COMPLETE'
+  analysis_mode: 'STATIC_INVARIANT_REVIEW'
+  execution_performed: false
+  invariant: CustomTargetProposal['proposed_invariant']
+  files_scanned: number
+  operations_reviewed: number
+  high_risk_operations: number
+  file_results: Array<{
+    file: string
+    kind: 'python' | 'sql'
+    finding_count: number
+    operations?: string[]
+    database_operations?: number
+    statements?: Record<string, number>
+    uses_for_update?: boolean
+  }>
+  findings: Array<{
+    entrypoint: string
+    file: string
+    function: string
+    line: number
+    signals: string[]
+    risk: string
+    severity: string
+    framework: string
+    invariant_assertion: string
+    invariant_source: 'suggested' | 'human_approved'
+    assessment: string
+    recommended_control: string
+    suggested_patch: string | null
+    patch_status: 'UNVERIFIED_STATIC_SUGGESTION' | 'GUIDANCE_ONLY'
+  }>
+  limitations: string[]
 }

@@ -4,7 +4,7 @@ import {
   Clock, Code2, Database, ExternalLink, GitCompare, Loader2, LockKeyhole, Pause,
   Play, ShieldCheck, SkipBack, SkipForward, TerminalSquare, X, Gauge,
 } from 'lucide-react'
-import type { CustomTargetProposal, InvariantResult, ModelStatus, RunEvent, RunReport, ScheduleResult, Target, UsageSnapshot } from './types'
+import type { CustomAnalysis, CustomTargetProposal, InvariantResult, ModelStatus, RunEvent, RunReport, ScheduleResult, Target, UsageSnapshot } from './types'
 
 const API = import.meta.env.VITE_API_URL ?? ''
 const stages = ['load_target', 'inspect', 'investigate', 'execute_experiment', 'observe', 'repair', 'apply_patch', 'verify', 'human_review', 'finalize']
@@ -123,6 +123,8 @@ function App() {
   const [uploadFiles, setUploadFiles] = useState<File[]>([])
   const [uploading, setUploading] = useState(false)
   const [customProposal, setCustomProposal] = useState<CustomTargetProposal | null>(null)
+  const [customAnalysis, setCustomAnalysis] = useState<CustomAnalysis | null>(null)
+  const [activeCustomRun, setActiveCustomRun] = useState(false)
   const [contractAssertion, setContractAssertion] = useState('')
   const folderInput = useRef<HTMLInputElement>(null)
 
@@ -148,7 +150,7 @@ function App() {
     }).catch(() => setError('Could not load target applications.'))
   }, [])
 
-  async function startRun() {
+  async function startRun(runTargetId = targetId) {
     const previousStatus = status
     setError(null); setStatus('QUEUED')
     const controller = new AbortController()
@@ -156,7 +158,7 @@ function App() {
     try {
       const response = await fetch(`${API}/api/runs`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ target_id: targetId }),
+        body: JSON.stringify({ target_id: runTargetId }),
         signal: controller.signal,
       })
       const body = await response.json().catch(() => null)
@@ -164,6 +166,7 @@ function App() {
       setEvents([]); setReport(null)
       localStorage.setItem('raceproof.runId', body.run_id)
       setRunId(body.run_id)
+      setActiveCustomRun(runTargetId.startsWith('custom_'))
     } catch (error) {
       setStatus(terminalStatus(previousStatus) ? previousStatus : 'READY')
       if (error instanceof DOMException && error.name === 'AbortError') {
@@ -210,7 +213,8 @@ function App() {
       const body = await response.json().catch(() => null)
       if (!response.ok) throw new Error(body?.detail ?? `Upload failed (${response.status})`)
       setCustomProposal(body)
-      setContractAssertion(body.proposed_invariant.assertion)
+      setCustomAnalysis(null)
+      setContractAssertion(body.selected_operation?.suggested_invariant?.assertion ?? '')
     } finally {
       setUploading(false)
     }
@@ -231,6 +235,28 @@ function App() {
       const body = await response.json().catch(() => null)
       if (!response.ok) throw new Error(body?.detail ?? `Approval failed (${response.status})`)
       setCustomProposal(body)
+      setCustomAnalysis(null)
+    } finally {
+      setUploading(false)
+    }
+  }
+
+  async function analyzeApprovedUpload() {
+    if (!customProposal) return
+    setUploading(true); setError(null)
+    try {
+      const response = await fetch(`${API}/api/targets/custom/${customProposal.target_id}/analyze`, { method: 'POST' })
+      const body = await response.json().catch(() => null)
+      if (!response.ok) throw new Error(body?.detail ?? `Custom analysis failed (${response.status})`)
+      setCustomAnalysis(body)
+      setCustomProposal(current => current ? {
+        ...current,
+        status: body.status === 'CUSTOM_ANALYSIS_COMPLETE' ? 'CUSTOM_ANALYSIS_COMPLETE' : 'PENDING_CONTRACT_APPROVAL',
+        proposed_invariant: body.status === 'CUSTOM_ANALYSIS_COMPLETE'
+          ? current.proposed_invariant
+          : { ...current.proposed_invariant, assertion: '', approved: false },
+      } : current)
+      if (body.status !== 'CUSTOM_ANALYSIS_COMPLETE') setContractAssertion('')
     } finally {
       setUploading(false)
     }
@@ -343,20 +369,23 @@ function App() {
   const liveUsage = [...events].reverse().find(event => event.kind === 'usage')?.detail as UsageSnapshot | undefined
   const usage = report?.usage ?? liveUsage
   const target = targets.find(item => item.id === targetId)
-  const actors = target?.actors ?? []
+  const customMode = uploadFiles.length > 0 || customProposal !== null
+  const actors = customMode && customProposal ? customProposal.actors.map(actor => actor.id) : target?.actors ?? []
   const evidence = Object.entries(invariant?.evidence ?? {}).slice(0, 3)
   const busy = !terminalStatus(status)
+  const customContractApproved = customProposal !== null && customProposal.status !== 'PENDING_CONTRACT_APPROVAL'
+  const customExecutionReady = Boolean(customProposal?.execution_ready)
 
   return <main>
     <header className="topbar">
       <div className="brand"><div className="brand-mark"><LockKeyhole size={18} /></div><div><strong>RaceProof</strong><span>Concurrency lab</span></div></div>
       <div className="connection"><span className={`pulse ${health ? 'online' : ''}`} /> PostgreSQL {health === null ? 'checking' : health ? 'connected' : 'offline'}</div>
-      <div className="header-actions"><label className="folder-button"><input ref={folderInput} type="file" multiple accept=".py,.sql" onChange={event => setUploadFiles(Array.from(event.target.files ?? []))}/>Choose code folder</label><select value={targetId} onChange={event => setTargetId(event.target.value)} disabled={busy}>{targets.map(item => <option value={item.id} key={item.id}>{item.name}</option>)}</select><StatusPill status={status} /><button className="run-button" onClick={() => startRun().catch(e => setError(e.message))} disabled={busy || status === 'AWAITING_HUMAN_REVIEW' || health === false || !targetId}>{busy ? <Loader2 size={16} className="spin" /> : <Play size={15} fill="currentColor" />}Run investigation</button></div>
+      <div className="header-actions"><label className="folder-button"><input ref={folderInput} type="file" multiple accept=".py,.sql" onChange={event => { setUploadFiles(Array.from(event.target.files ?? [])); setCustomProposal(null); setCustomAnalysis(null); setActiveCustomRun(false); localStorage.removeItem('raceproof.runId'); setRunId(null); setEvents([]); setReport(null); setError(null) }}/>Choose code folder</label><select value={targetId} onChange={event => setTargetId(event.target.value)} disabled={busy || customMode}>{targets.map(item => <option value={item.id} key={item.id}>{item.name}</option>)}</select><StatusPill status={activeCustomRun ? status : customMode ? (customExecutionReady ? 'READY TO RUN' : customAnalysis ? 'CUSTOM ANALYZED' : customContractApproved ? 'CONTRACT APPROVED' : 'CUSTOM UPLOAD') : status} /><button className="run-button" onClick={() => (customExecutionReady && customProposal ? startRun(customProposal.target_id) : customMode ? analyzeApprovedUpload() : startRun()).catch(e => setError(e.message))} disabled={customMode ? (customExecutionReady ? (busy || health === false) : (!customProposal || uploading)) : (busy || status === 'AWAITING_HUMAN_REVIEW' || health === false || !targetId)}>{uploading || (activeCustomRun && busy) || (!customMode && busy) ? <Loader2 size={16} className="spin" /> : <Play size={15} fill="currentColor" />}{customExecutionReady ? 'Run full investigation' : customMode ? (customAnalysis ? 'Re-analyze uploaded code' : 'Analyze uploaded code') : 'Run investigation'}</button></div>
     </header>
 
     <section className="hero">
-      <div><div className="eyebrow">LIVE EXPERIMENT · {target?.name.toUpperCase() ?? 'SELECT A TARGET'}</div><h1>Make the invisible<br/><em>interleaving</em> visible.</h1><p>{target?.description ?? 'Controlled PostgreSQL transactions. Executable business invariants. Model-authored patches behind deterministic gates.'}</p></div>
-      <div className="hero-side"><Metric label="Operation" value={target?.operation.split(':').at(-1) ?? '-'}/><Metric label="Actors" value={actors.join(' + ') || '-'}/><Metric label="SQL events" value={sqlCount.toString().padStart(2, '0')} accent/></div>
+      <div><div className="eyebrow">{customMode ? 'CUSTOM CODE · STATIC INVARIANT REVIEW' : `LIVE EXPERIMENT · ${target?.name.toUpperCase() ?? 'SELECT A TARGET'}`}</div><h1>Make the invisible<br/><em>interleaving</em> visible.</h1><p>{customMode ? `Review every uploaded Python and SQL file against ${customContractApproved ? 'the human-approved invariant' : 'suggested invariants for each detected operation'}. Execution remains disabled until an application adapter is available.` : target?.description ?? 'Controlled PostgreSQL transactions. Executable business invariants. Model-authored patches behind deterministic gates.'}</p></div>
+      <div className="hero-side"><Metric label="Operation" value={customMode ? (customProposal?.selected_operation?.function ?? 'Awaiting scan') : (target?.operation.split(':').at(-1) ?? '-')}/><Metric label={customMode ? 'Files' : 'Actors'} value={customMode ? (customProposal?.files.length ?? uploadFiles.length) : actors.join(' + ') || '-'}/><Metric label={customMode ? 'Findings' : 'SQL events'} value={customMode ? (customAnalysis?.operations_reviewed ?? 0) : sqlCount.toString().padStart(2, '0')} accent/></div>
     </section>
 
     {error && <div className="error-banner"><AlertTriangle size={17}/><span>{error}</span></div>}
@@ -365,14 +394,22 @@ function App() {
       <div className="panel-head"><div><span className="kicker">CUSTOM CODE · GATE 1</span><h2>Analyze and approve target contract</h2></div><Code2 size={20}/></div>
       {!customProposal ? <><p>{uploadFiles.length} Python/SQL files selected. Files are parsed statically and are not imported or executed.</p><button className="run-button" disabled={uploading} onClick={() => analyzeFolder().catch(error => setError(error.message))}>{uploading ? <Loader2 size={15} className="spin"/> : <Activity size={15}/>}Analyze &amp; generate contract</button></> : <>
         <div className="contract-grid"><div><span>Operation</span><strong>{customProposal.selected_operation?.entrypoint ?? 'No operation detected'}</strong></div><div><span>Risk</span><strong>{customProposal.selected_operation?.risk.replaceAll('_', ' ') ?? 'Manual review required'}</strong></div><div><span>Actors</span><strong>{customProposal.actors.map(actor => actor.id).join(' + ')}</strong></div><div><span>Editable paths</span><strong>{customProposal.editable_paths.join(', ') || 'None'}</strong></div></div>
-        <label className="contract-field"><span>Human-approved executable invariant</span><textarea value={contractAssertion} onChange={event => setContractAssertion(event.target.value)}/></label>
+        <label className="contract-field"><span>Optional human-approved invariant for a future executable run</span><textarea value={contractAssertion} placeholder="Example: account.balance >= 0" onChange={event => setContractAssertion(event.target.value)}/></label>
         <div className="contract-schedule"><strong>{customProposal.reproduction_schedule.name}</strong><p>{customProposal.reproduction_schedule.description}</p><small>{customProposal.reproduction_schedule.checkpoints.join(' → ')}</small></div>
         {!!customProposal.warnings.length && <div className="error-banner"><AlertTriangle size={16}/><span>{customProposal.warnings.join('; ')}</span></div>}
         <p className="execution-blocker">{customProposal.execution_blocker}</p>
-        {customProposal.status === 'PENDING_CONTRACT_APPROVAL' ? <div className="review-actions"><button className="approve" disabled={uploading || !contractAssertion} onClick={() => approveContract().catch(error => setError(error.message))}>Approve analysis contract</button><button onClick={() => setCustomProposal(null)}>Revise upload</button></div> : <div className="cycle-status safe">CONTRACT APPROVED · ANALYSIS ONLY</div>}
+        {customProposal.status === 'PENDING_CONTRACT_APPROVAL' ? <><div className="cycle-status safe">STATIC ANALYSIS IS READY WITHOUT APPROVAL</div><div className="review-actions"><button className="approve" disabled={uploading} onClick={() => analyzeApprovedUpload().catch(error => setError(error.message))}>{uploading ? 'Analyzing uploaded files…' : 'Analyze all uploaded files'}</button><button disabled={uploading || !contractAssertion} onClick={() => approveContract().catch(error => setError(error.message))}>Approve invariant and prepare execution</button><button onClick={() => { setCustomProposal(null); setCustomAnalysis(null); setActiveCustomRun(false) }}>Revise upload</button></div></> : <><div className="cycle-status safe">{customExecutionReady ? 'ADAPTER READY · POSTGRESQL EXECUTION ENABLED' : customAnalysis ? 'UPLOADED CODE ANALYZED · STATIC EVIDENCE ONLY' : 'CONTRACT APPROVED · ADAPTER REQUIRED'}</div><div className="review-actions">{customExecutionReady && <button className="approve" disabled={busy} onClick={() => startRun(customProposal.target_id).catch(error => setError(error.message))}>Run full investigation</button>}<button disabled={uploading} onClick={() => analyzeApprovedUpload().catch(error => setError(error.message))}>{uploading ? 'Analyzing uploaded files…' : 'Re-analyze uploaded files'}</button><button onClick={() => { setCustomProposal(null); setCustomAnalysis(null); setActiveCustomRun(false) }}>Upload another folder</button></div></>}
+        {customAnalysis && <div className="custom-analysis">
+          <div className="invariant-stats"><Metric label="Files scanned" value={customAnalysis.files_scanned}/><Metric label="Operations reviewed" value={customAnalysis.operations_reviewed}/><Metric label="High-risk operations" value={customAnalysis.high_risk_operations} accent/></div>
+          <div className="agent-summary"><strong>{customAnalysis.invariant.approved ? 'Approved invariant used for this review' : 'Suggested invariants are shown per finding'}</strong><p>{customAnalysis.invariant.assertion}</p><small>No uploaded code was executed and no PostgreSQL reproduction is claimed.</small></div>
+          {customAnalysis.file_results.map(file => <div className="activity-row" key={file.file}><span className="activity-icon"><ChevronRight size={13}/></span><div><strong>{file.file}</strong><small>{file.kind === 'python' ? `${file.finding_count} database operation finding(s)` : `${file.database_operations ?? 0} SQL operation(s)${file.uses_for_update ? ' · FOR UPDATE present' : ''}`}</small></div></div>)}
+          {customAnalysis.findings.map(finding => <div className="agent-summary" key={finding.entrypoint}><strong>{finding.entrypoint} · {finding.severity.toUpperCase()} · {finding.framework.replaceAll('_', ' ')}</strong><p><b>Invariant: </b>{finding.invariant_assertion} ({finding.invariant_source.replaceAll('_', ' ')})</p><p>{finding.assessment}</p><small>{finding.recommended_control}</small>{finding.suggested_patch && <><div className="cycle-status warn">{finding.patch_status.replaceAll('_', ' ')}</div><pre className="static-patch">{finding.suggested_patch}</pre></>}</div>)}
+          <div className="execution-blocker">{customAnalysis.limitations.join(' ')}</div>
+        </div>}
       </>}
     </section>}
 
+    {(!customMode || activeCustomRun) && <>
     <section className="stage-rail">
       {stages.map((stage, index) => {
         const current = stages.indexOf(currentStage); const done = visitedStages.has(stage) && current !== index
@@ -401,7 +438,7 @@ function App() {
 
       <article className="panel invariant-panel">
         <div className="panel-head"><div><span className="kicker">DETERMINISTIC ORACLE</span><h2>Business invariant</h2></div><ShieldCheck size={20}/></div>
-        <code>{invariant?.assertion ?? target?.invariant?.description ?? 'Waiting for the approved target invariant'}</code>
+        <code>{invariant?.assertion ?? (customMode ? customProposal?.proposed_invariant.assertion : target?.invariant?.description) ?? 'Waiting for the approved target invariant'}</code>
         <div className={`verdict ${invariant ? (invariant.passed ? 'pass' : 'fail') : ''}`}>
           {invariant ? (invariant.passed ? <Check/> : <X/>) : <CircleDot/>}
           <div><span>INVARIANT</span><strong>{invariant ? (invariant.passed ? 'PASSED' : 'FAILED') : 'PENDING'}</strong></div>
@@ -490,6 +527,7 @@ function App() {
       <div className="panel-head"><div><span className="kicker">REVIEWABLE ARTIFACT</span><h2>Candidate patch</h2></div><Code2 size={20}/></div>
       <pre>{report?.final_diff ?? 'No verified candidate diff. Live repair requires a configured model API key; failed or unverified patches are never promoted.'}</pre>
     </section>
+    </>}
 
 
     <footer><span>RaceProof experimental prototype</span><span>Finite tests establish observed evidence, not formal race freedom.</span>{runId && <span>RUN {runId}</span>}</footer>
